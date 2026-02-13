@@ -103,7 +103,7 @@ def get_gemini_client():
     """Gemini APIクライアントを取得"""
     api_key = get_secret("GEMINI_API_KEY")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-2.0-flash-exp')
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 def extract_text_from_pdf(file_data: bytes) -> str:
     """PDFバイナリデータからテキストを抽出"""
