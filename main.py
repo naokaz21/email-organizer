@@ -118,6 +118,55 @@ def extract_text_from_pdf(file_data: bytes) -> str:
         print(f"PDF解析エラー: {e}")
         return ""
 
+def extract_text_from_image(file_data: bytes, gemini_client) -> str:
+    """画像ファイルからテキストを抽出（Gemini Vision使用）"""
+    try:
+        import PIL.Image
+        image = PIL.Image.open(io.BytesIO(file_data))
+
+        prompt = """この画像は不動産の販売図面です。画像内のすべてのテキストを抽出してください。
+特に以下の情報を正確に抽出してください：
+- 住所
+- 物件番号
+- 専有面積
+- 間取り
+- 築年月
+- 管理費
+- 修繕積立金
+- その他すべての文字情報
+
+すべてのテキストを改行で区切って出力してください。"""
+
+        response = gemini_client.generate_content([prompt, image])
+        text = response.text.strip()
+        print(f"画像からテキスト抽出完了: {len(text)} 文字")
+        return text
+    except Exception as e:
+        print(f"画像解析エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+def is_hanbaizumen(text: str) -> bool:
+    """テキスト内容から販売図面かどうかを判定（キーワードベース）"""
+    # 販売図面に特有のキーワード
+    keywords = [
+        '販売図面',
+        '物件番号',
+        '専有面積',
+        '間取り',
+        'バルコニー面積',
+        '築年月',
+        '総戸数',
+        '管理費',
+        '修繕積立金'
+    ]
+
+    # 3つ以上のキーワードが含まれていれば販売図面と判定
+    match_count = sum(1 for keyword in keywords if keyword in text)
+    print(f"販売図面判定: {match_count}個のキーワードマッチ")
+    return match_count >= 3
+
 def extract_address_with_regex(text: str) -> Optional[str]:
     """正規表現で住所を抽出"""
     patterns = [
@@ -264,31 +313,36 @@ def generate_property_evaluation_report(
     folder_id: str,
     pdf_file_id: str,
     property_number: str,
-    station: str
+    station: str,
+    extracted_text: Optional[str] = None
 ) -> Optional[str]:
     """物件評価レポートを生成するメインフロー"""
 
     print(f"レポート生成開始: 物件番号={property_number}")
 
     try:
-        # 1. PDFダウンロード
-        request = drive_service.files().get_media(fileId=pdf_file_id)
-        fh = io.BytesIO()
-        from googleapiclient.http import MediaIoBaseDownload
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
+        # 1. テキスト取得（既に抽出済みの場合はそれを使用）
+        if extracted_text:
+            text = extracted_text
+            print(f"抽出済みテキスト使用: {len(text)} 文字")
+        else:
+            # PDFダウンロードしてテキスト抽出
+            request = drive_service.files().get_media(fileId=pdf_file_id)
+            fh = io.BytesIO()
+            from googleapiclient.http import MediaIoBaseDownload
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
 
-        pdf_data = fh.getvalue()
-        print(f"PDF取得完了: {len(pdf_data)} bytes")
+            pdf_data = fh.getvalue()
+            print(f"PDF取得完了: {len(pdf_data)} bytes")
 
-        # 2. テキスト抽出
-        text = extract_text_from_pdf(pdf_data)
-        if not text:
-            print("エラー: PDFからテキスト抽出失敗")
-            return None
-        print(f"テキスト抽出完了: {len(text)} 文字")
+            text = extract_text_from_pdf(pdf_data)
+            if not text:
+                print("エラー: PDFからテキスト抽出失敗")
+                return None
+            print(f"テキスト抽出完了: {len(text)} 文字")
 
         # 3. 住所抽出（正規表現 → Geminiフォールバック）
         address = extract_address_with_regex(text)
@@ -355,7 +409,7 @@ def get_or_create_label(gmail_service, label_name):
     return label['id']
 
 def extract_property_info_from_hanbaizumen(message_body, attachments):
-    """販売図面メールから物件情報を抽出"""
+    """販売図面メールから物件情報を抽出（Gemini使用）"""
     property_number = None
     station = None
 
@@ -366,24 +420,61 @@ def extract_property_info_from_hanbaizumen(message_body, attachments):
             property_number = match.group(1)
             break
 
-    # 本文から物件番号と駅名を抽出
-    match = re.search(r'物件番号[:：]\s*(\d+)\s*駅[:：]\s*([^\s\r\n]+)', message_body)
-    if match:
+    # Gemini APIで本文から物件番号と駅名を抽出
+    try:
+        gemini_client = get_gemini_client()
+
+        prompt = f"""あなたは不動産メールから物件情報を抽出する専門アシスタントです。
+
+タスク: 以下のメール本文から物件番号と最寄駅を抽出してください。
+
+抽出条件:
+- 物件番号: "物件番号:数字" "物件番号：数字" "hid=数字" という記載から数字部分のみ
+- 駅名: "駅名+駅" "駅:駅名" "駅：駅名" という記載から駅名部分のみ（「駅」という文字は除く）
+- 見つからない場合はnull
+
+重要: メール本文に実際に書かれている情報のみを抽出してください。推測・補完は禁止です。
+
+=== メール本文ここから ===
+{message_body}
+=== メール本文ここまで ===
+
+JSON形式で回答:
+{{"property_number": "数字のみ", "station": "駅名のみ"}}"""
+
+        response = gemini_client.generate_content(prompt)
+        result_text = response.text.strip()
+
+        # JSONとして解析
+        import json
+        # ```json ``` で囲まれている場合は除去
+        if result_text.startswith('```'):
+            result_text = result_text.split('```')[1]
+            if result_text.startswith('json'):
+                result_text = result_text[4:]
+            result_text = result_text.strip()
+
+        result = json.loads(result_text)
+
+        # 物件番号（添付ファイル名から取得できていない場合のみ）
+        if not property_number and result.get('property_number'):
+            property_number = str(result['property_number'])
+
+        # 駅名
+        if result.get('station'):
+            station = result['station']
+
+        print(f"✅ Gemini抽出成功 - 物件番号: {property_number}, 駅: {station}")
+
+    except Exception as e:
+        print(f"⚠️  Gemini抽出エラー（フォールバック実行）: {e}")
+
+        # フォールバック: URLから物件番号を取得
         if not property_number:
-            property_number = match.group(1)
-        station = match.group(2)
-
-    # 本文のURLからも物件番号を取得（バックアップ）
-    if not property_number:
-        url_match = re.search(r'hid=(\d+)', message_body)
-        if url_match:
-            property_number = url_match.group(1)
-
-    # 駅名が取れなかった場合の追加パターン
-    if not station:
-        station_match = re.search(r'駅[:：]\s*([^\s\r\n,、]+)', message_body)
-        if station_match:
-            station = station_match.group(1)
+            url_match = re.search(r'hid=(\d+)', message_body)
+            if url_match:
+                property_number = url_match.group(1)
+                print(f"📍 URLから物件番号抽出: {property_number}")
 
     if not station:
         station = '不明'
@@ -482,24 +573,43 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
         try:
             message = gmail.users().messages().get(userId='me', id=msg['id']).execute()
 
-            # 本文取得
+            # 本文取得（再帰的にpartsを探索）
+            import base64
             body = ""
             attachments = []
-            if 'parts' in message['payload']:
-                for part in message['payload']['parts']:
-                    if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
-                        import base64
+
+            def extract_body_and_attachments(parts):
+                nonlocal body, attachments
+                for part in parts:
+                    mime_type = part.get('mimeType', '')
+
+                    # text/plain を見つけたら本文として取得
+                    if mime_type == 'text/plain' and 'data' in part.get('body', {}):
                         body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+
+                    # 添付ファイル
                     if part.get('filename'):
                         attachments.append(part)
+
+                    # multipart/* の場合は再帰的に探索
+                    if mime_type.startswith('multipart/') and 'parts' in part:
+                        extract_body_and_attachments(part['parts'])
+
+            if 'parts' in message['payload']:
+                extract_body_and_attachments(message['payload']['parts'])
+
+            # parts がない、またはbodyが空の場合のフォールバック
+            if not body and 'body' in message['payload'] and 'data' in message['payload']['body']:
+                body = base64.urlsafe_b64decode(message['payload']['body']['data']).decode('utf-8', errors='ignore')
 
             # 物件情報抽出
             info = extract_info_fn(body, attachments) if len(extract_info_fn.__code__.co_varnames) > 1 else extract_info_fn(body)
             property_number, station = info
 
             if not property_number:
-                print(f"物件番号を抽出できませんでした: {message.get('snippet', '')[:50]}")
-                continue
+                print(f"⚠️  物件番号を抽出できませんでした（処理は継続）: {message.get('snippet', '')[:50]}")
+                # 物件番号がない場合はメッセージIDの一部を使用
+                property_number = msg['id'][:8]
 
             print(f"処理中: 物件番号={property_number} 駅={station}")
 
@@ -545,36 +655,48 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
                     uploaded_file = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
                     print(f"保存完了: {filename} → {folder_name}")
 
-                    # 販売図面PDFの場合、評価レポート生成
-                    if filename.endswith('.pdf') and 'Hanbaizumen' in filename:
-                        try:
-                            print(f"販売図面PDF検出、評価レポート生成を開始: {filename}")
+                    # PDF/画像の場合、中身を確認して販売図面か判定
+                    is_pdf = filename.lower().endswith('.pdf')
+                    is_image = filename.lower().endswith(('.jpg', '.jpeg', '.png'))
 
-                            # APIクライアント初期化
-                            docs_service = get_docs_service()
-                            gmaps_client = get_gmaps_client()
+                    if is_pdf or is_image:
+                        # テキスト抽出
+                        if is_pdf:
+                            extracted_text = extract_text_from_pdf(file_data)
+                        else:  # 画像
                             gemini_client = get_gemini_client()
+                            extracted_text = extract_text_from_image(file_data, gemini_client)
 
-                            # レポート生成
-                            report_doc_id = generate_property_evaluation_report(
-                                drive_service=drive,
-                                docs_service=docs_service,
-                                gmaps_client=gmaps_client,
-                                gemini_client=gemini_client,
-                                folder_id=folder_id,
-                                pdf_file_id=uploaded_file['id'],
-                                property_number=property_number,
-                                station=station
-                            )
+                        if is_hanbaizumen(extracted_text):
+                            try:
+                                print(f"販売図面検出、評価レポート生成を開始: {filename}")
 
-                            if report_doc_id:
-                                print(f"評価レポート生成成功: {report_doc_id}")
-                            else:
-                                print(f"評価レポート生成失敗（処理は継続）")
-                        except Exception as e:
-                            print(f"レポート生成エラー（処理継続）: {e}")
-                            import traceback
-                            traceback.print_exc()
+                                # APIクライアント初期化
+                                docs_service = get_docs_service()
+                                gmaps_client = get_gmaps_client()
+                                gemini_client = get_gemini_client()
+
+                                # レポート生成（extracted_textを渡す）
+                                report_doc_id = generate_property_evaluation_report(
+                                    drive_service=drive,
+                                    docs_service=docs_service,
+                                    gmaps_client=gmaps_client,
+                                    gemini_client=gemini_client,
+                                    folder_id=folder_id,
+                                    pdf_file_id=uploaded_file['id'],
+                                    property_number=property_number,
+                                    station=station,
+                                    extracted_text=extracted_text
+                                )
+
+                                if report_doc_id:
+                                    print(f"評価レポート生成成功: {report_doc_id}")
+                                else:
+                                    print(f"評価レポート生成失敗（処理は継続）")
+                            except Exception as e:
+                                print(f"レポート生成エラー（処理継続）: {e}")
+                                import traceback
+                                traceback.print_exc()
 
             # 処理済みラベル追加
             gmail.users().messages().modify(
