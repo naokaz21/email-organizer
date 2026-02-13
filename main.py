@@ -726,7 +726,7 @@ def process_emails():
     all_results = []
 
     # 販売図面メールを処理
-    query1 = f'subject:販売図面 newer_than:2h has:attachment -label:{label_name}'
+    query1 = f'subject:販売図面 newer_than:15m has:attachment -label:{label_name}'
     results1 = process_email_type(
         gmail, drive, query1, label_name, processed_label_id,
         investment_folder_id, extract_property_info_from_hanbaizumen
@@ -734,7 +734,7 @@ def process_emails():
     all_results.extend(results1)
 
     # 住宅地図・路線価図メールを処理
-    query2 = f'subject:住宅地図・路線価図 newer_than:2h has:attachment -label:{label_name}'
+    query2 = f'subject:住宅地図・路線価図 newer_than:15m has:attachment -label:{label_name}'
     results2 = process_email_type(
         gmail, drive, query2, label_name, processed_label_id,
         investment_folder_id, extract_property_info_from_chizu
