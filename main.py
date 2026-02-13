@@ -918,7 +918,12 @@ def extract_property_info_from_chizu(message_body):
     if not station:
         station = '不明'
 
-    return property_number, station
+    # 新形式（dict）で返す
+    return {
+        'property_number': property_number,
+        'station': station,
+        'detailed_data': {}
+    }
 
 def get_or_create_folder(drive_service, parent_folder_id, folder_name, property_number):
     """Driveフォルダを取得または作成（物件番号で部分一致検索）"""
