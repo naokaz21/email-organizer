@@ -103,7 +103,8 @@ def get_gemini_client():
     """Gemini APIクライアントを取得"""
     api_key = get_secret("GEMINI_API_KEY")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    # Gemini 2.5 Flash (2026年現在の推奨モデル、1.5は廃止済み)
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 def get_perplexity_client():
     """Perplexity APIクライアントを取得（OpenAI互換）"""
