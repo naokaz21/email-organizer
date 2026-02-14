@@ -575,18 +575,6 @@ def combine_research_reports(gemini_market_report: dict, perplexity_area_report:
 
     return "\n".join(combined_parts)
 
-def _find_placeholder_index(docs_service, doc_id, placeholder):
-    """ドキュメント内のプレースホルダー文字列のインデックスを検索"""
-    doc = docs_service.documents().get(documentId=doc_id).execute()
-    for element in doc['body']['content']:
-        if 'paragraph' in element:
-            for run in element['paragraph'].get('elements', []):
-                text = run.get('textRun', {}).get('content', '')
-                if placeholder in text:
-                    return run['startIndex']
-    return None
-
-
 def _find_placeholder_range(docs_service, doc_id, placeholder):
     """プレースホルダー行全体のstart/endインデックスを返す"""
     doc = docs_service.documents().get(documentId=doc_id).execute()
@@ -600,8 +588,22 @@ def _find_placeholder_range(docs_service, doc_id, placeholder):
     return None, None
 
 
+# デザイン定数（McKinsey/BCG品質）
+_NAVY = {'red': 0.11, 'green': 0.18, 'blue': 0.33}      # #1C2E54 ダークネイビー
+_LIGHT_NAVY = {'red': 0.22, 'green': 0.33, 'blue': 0.53}  # #385487
+_HEADER_BG = {'red': 0.11, 'green': 0.18, 'blue': 0.33}   # テーブルヘッダー背景
+_HEADER_TEXT = {'red': 1.0, 'green': 1.0, 'blue': 1.0}     # 白文字
+_ALT_ROW_BG = {'red': 0.95, 'green': 0.96, 'blue': 0.98}   # #F2F5FA 交互行
+_BORDER_COLOR = {'red': 0.80, 'green': 0.82, 'blue': 0.86}  # #CCD1DB 薄いグレー
+_ACCENT = {'red': 0.16, 'green': 0.50, 'blue': 0.73}       # #2980BA アクセント青
+
+
+def _rgb(color_dict):
+    return {'color': {'rgbColor': color_dict}}
+
+
 def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, col_count):
-    """プレースホルダーをテーブルに置換し、セルにデータを入力"""
+    """プレースホルダーをスタイル付きテーブルに置換"""
     start, end = _find_placeholder_range(docs_service, doc_id, placeholder)
     if start is None:
         print(f"プレースホルダー未検出: {placeholder}")
@@ -623,17 +625,21 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
         }}]}
     ).execute()
 
-    # ドキュメント再取得してテーブルセルのインデックスを取得
+    # ドキュメント再取得してテーブル構造を取得
     doc = docs_service.documents().get(documentId=doc_id).execute()
-    table = None
+    table_element = None
+    table_start_index = None
     for element in doc['body']['content']:
         if 'table' in element and element['startIndex'] >= start:
-            table = element['table']
+            table_element = element
+            table_start_index = element['startIndex']
             break
 
-    if not table:
+    if not table_element:
         print(f"テーブル未検出: {placeholder}")
         return
+
+    table = table_element['table']
 
     # セルにデータを入力（逆順でインデックスずれ防止）
     cell_requests = []
@@ -648,33 +654,131 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
 
     if cell_requests:
         docs_service.documents().batchUpdate(
-            documentId=doc_id,
-            body={'requests': cell_requests}
+            documentId=doc_id, body={'requests': cell_requests}
         ).execute()
 
-    # ヘッダー行（1行目）を太字にする
+    # === テーブルスタイリング ===
+    style_requests = []
+
+    # ヘッダー行: ネイビー背景 + 白太字
+    style_requests.append({
+        'updateTableCellStyle': {
+            'tableCellStyle': {
+                'backgroundColor': _rgb(_HEADER_BG),
+                'paddingTop': {'magnitude': 5, 'unit': 'PT'},
+                'paddingBottom': {'magnitude': 5, 'unit': 'PT'},
+                'paddingLeft': {'magnitude': 7, 'unit': 'PT'},
+                'paddingRight': {'magnitude': 7, 'unit': 'PT'},
+            },
+            'fields': 'backgroundColor,paddingTop,paddingBottom,paddingLeft,paddingRight',
+            'tableRange': {
+                'tableCellLocation': {'tableStartLocation': {'index': table_start_index}, 'rowIndex': 0, 'columnIndex': 0},
+                'rowSpan': 1, 'columnSpan': col_count
+            }
+        }
+    })
+
+    # データ行: パディング + 交互背景色
+    for r in range(1, row_count):
+        bg = _ALT_ROW_BG if r % 2 == 0 else {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+        style_requests.append({
+            'updateTableCellStyle': {
+                'tableCellStyle': {
+                    'backgroundColor': _rgb(bg),
+                    'paddingTop': {'magnitude': 4, 'unit': 'PT'},
+                    'paddingBottom': {'magnitude': 4, 'unit': 'PT'},
+                    'paddingLeft': {'magnitude': 7, 'unit': 'PT'},
+                    'paddingRight': {'magnitude': 7, 'unit': 'PT'},
+                },
+                'fields': 'backgroundColor,paddingTop,paddingBottom,paddingLeft,paddingRight',
+                'tableRange': {
+                    'tableCellLocation': {'tableStartLocation': {'index': table_start_index}, 'rowIndex': r, 'columnIndex': 0},
+                    'rowSpan': 1, 'columnSpan': col_count
+                }
+            }
+        })
+
+    # 全セルのボーダー: 薄いグレー
+    style_requests.append({
+        'updateTableCellStyle': {
+            'tableCellStyle': {
+                'borderTop': {'color': _rgb(_BORDER_COLOR), 'width': {'magnitude': 0.5, 'unit': 'PT'}, 'dashStyle': 'SOLID'},
+                'borderBottom': {'color': _rgb(_BORDER_COLOR), 'width': {'magnitude': 0.5, 'unit': 'PT'}, 'dashStyle': 'SOLID'},
+                'borderLeft': {'color': _rgb(_BORDER_COLOR), 'width': {'magnitude': 0.5, 'unit': 'PT'}, 'dashStyle': 'SOLID'},
+                'borderRight': {'color': _rgb(_BORDER_COLOR), 'width': {'magnitude': 0.5, 'unit': 'PT'}, 'dashStyle': 'SOLID'},
+            },
+            'fields': 'borderTop,borderBottom,borderLeft,borderRight',
+            'tableRange': {
+                'tableCellLocation': {'tableStartLocation': {'index': table_start_index}, 'rowIndex': 0, 'columnIndex': 0},
+                'rowSpan': row_count, 'columnSpan': col_count
+            }
+        }
+    })
+
+    if style_requests:
+        try:
+            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+        except Exception as e:
+            print(f"テーブルスタイル適用エラー（無視）: {e}")
+
+    # ドキュメント再取得（テキスト挿入でインデックスが変わったため）
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    table_element = None
+    for element in doc['body']['content']:
+        if 'table' in element and element['startIndex'] >= start:
+            table_element = element
+            break
+
+    if not table_element:
+        return
+
+    table = table_element['table']
+
+    # ヘッダー行テキスト: 白・太字・フォント設定
+    text_requests = []
     header_row = table['tableRows'][0]
-    bold_requests = []
     for c in range(col_count):
         cell = header_row['tableCells'][c]
-        cell_start = cell['content'][0]['paragraph']['elements'][0]['startIndex']
-        cell_end = cell['content'][0]['paragraph']['elements'][-1]['endIndex']
-        if cell_end > cell_start:
-            bold_requests.append({
+        el = cell['content'][0]['paragraph']['elements'][0]
+        cs = el['startIndex']
+        ce = el.get('endIndex', cs)
+        if ce > cs:
+            text_requests.append({
                 'updateTextStyle': {
-                    'range': {'startIndex': cell_start, 'endIndex': cell_end - 1},
-                    'textStyle': {'bold': True},
-                    'fields': 'bold'
+                    'range': {'startIndex': cs, 'endIndex': ce - 1},
+                    'textStyle': {
+                        'bold': True,
+                        'foregroundColor': _rgb(_HEADER_TEXT),
+                        'fontSize': {'magnitude': 9, 'unit': 'PT'},
+                    },
+                    'fields': 'bold,foregroundColor,fontSize'
                 }
             })
-    if bold_requests:
+
+    # データ行テキスト: フォントサイズ統一
+    for r in range(1, row_count):
+        row = table['tableRows'][r]
+        for c in range(col_count):
+            cell = row['tableCells'][c]
+            el = cell['content'][0]['paragraph']['elements'][0]
+            cs = el['startIndex']
+            ce = el.get('endIndex', cs)
+            if ce > cs:
+                text_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': cs, 'endIndex': ce - 1},
+                        'textStyle': {
+                            'fontSize': {'magnitude': 9, 'unit': 'PT'},
+                        },
+                        'fields': 'fontSize'
+                    }
+                })
+
+    if text_requests:
         try:
-            docs_service.documents().batchUpdate(
-                documentId=doc_id,
-                body={'requests': bold_requests}
-            ).execute()
+            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_requests}).execute()
         except Exception:
-            pass  # ヘッダー太字は見た目のみなのでエラーは無視
+            pass
 
 
 def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict) -> str:
@@ -696,7 +800,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
 
         # タイトル
         sections.append((f"{report_data['station']}_{report_data['property_number']} 物件調査レポート", 'TITLE'))
-        sections.append((f"調査日：{now}", 'NORMAL_TEXT'))
+        sections.append((f"調査日：{now}", 'SUBTITLE'))
 
         # A1. 物件概要
         sections.append(("A1. 物件概要", 'HEADING_1'))
@@ -753,9 +857,10 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         requests = [{'insertText': {'location': {'index': 1}, 'text': full_text}}]
         docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
 
-        # スタイル適用
+        # スタイル適用（段落スタイル + テキストスタイル）
         style_requests = []
-        idx = 1  # ドキュメントのインデックスは1から
+        text_style_requests = []
+        idx = 1
         for text, style in sections:
             end_idx = idx + len(text)
             if style != 'NORMAL_TEXT':
@@ -766,10 +871,121 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
                         'fields': 'namedStyleType'
                     }
                 })
-            idx = end_idx + 1  # +1 for \n separator
+            idx = end_idx + 1
 
         if style_requests:
             docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+
+        # カスタムカラー・フォント適用
+        idx = 1
+        for text, style in sections:
+            end_idx = idx + len(text)
+            if style == 'SUBTITLE':
+                text_style_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'textStyle': {
+                            'foregroundColor': _rgb({'red': 0.45, 'green': 0.45, 'blue': 0.45}),
+                            'fontSize': {'magnitude': 11, 'unit': 'PT'},
+                        },
+                        'fields': 'foregroundColor,fontSize'
+                    }
+                })
+                text_style_requests.append({
+                    'updateParagraphStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'paragraphStyle': {
+                            'spaceBelow': {'magnitude': 16, 'unit': 'PT'},
+                            'borderBottom': {
+                                'color': _rgb(_BORDER_COLOR),
+                                'width': {'magnitude': 0.5, 'unit': 'PT'},
+                                'padding': {'magnitude': 8, 'unit': 'PT'},
+                                'dashStyle': 'SOLID',
+                            },
+                        },
+                        'fields': 'spaceBelow,borderBottom'
+                    }
+                })
+            elif style == 'TITLE':
+                text_style_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'textStyle': {
+                            'foregroundColor': _rgb(_NAVY),
+                            'fontSize': {'magnitude': 22, 'unit': 'PT'},
+                            'bold': True,
+                        },
+                        'fields': 'foregroundColor,fontSize,bold'
+                    }
+                })
+            elif style == 'HEADING_1':
+                text_style_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'textStyle': {
+                            'foregroundColor': _rgb(_NAVY),
+                            'fontSize': {'magnitude': 16, 'unit': 'PT'},
+                            'bold': True,
+                        },
+                        'fields': 'foregroundColor,fontSize,bold'
+                    }
+                })
+                # HEADING_1の下に罫線風のスペーシング
+                text_style_requests.append({
+                    'updateParagraphStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'paragraphStyle': {
+                            'borderBottom': {
+                                'color': _rgb(_NAVY),
+                                'width': {'magnitude': 1.5, 'unit': 'PT'},
+                                'padding': {'magnitude': 6, 'unit': 'PT'},
+                                'dashStyle': 'SOLID',
+                            },
+                            'spaceBelow': {'magnitude': 10, 'unit': 'PT'},
+                            'spaceAbove': {'magnitude': 18, 'unit': 'PT'},
+                        },
+                        'fields': 'borderBottom,spaceBelow,spaceAbove'
+                    }
+                })
+            elif style == 'HEADING_2':
+                text_style_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'textStyle': {
+                            'foregroundColor': _rgb(_LIGHT_NAVY),
+                            'fontSize': {'magnitude': 12, 'unit': 'PT'},
+                            'bold': True,
+                        },
+                        'fields': 'foregroundColor,fontSize,bold'
+                    }
+                })
+                text_style_requests.append({
+                    'updateParagraphStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'paragraphStyle': {
+                            'spaceBelow': {'magnitude': 6, 'unit': 'PT'},
+                            'spaceAbove': {'magnitude': 12, 'unit': 'PT'},
+                        },
+                        'fields': 'spaceBelow,spaceAbove'
+                    }
+                })
+            elif style == 'NORMAL_TEXT' and text and not text.startswith('{{'):
+                text_style_requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'textStyle': {
+                            'fontSize': {'magnitude': 10, 'unit': 'PT'},
+                        },
+                        'fields': 'fontSize'
+                    }
+                })
+            idx = end_idx + 1
+
+        if text_style_requests:
+            try:
+                docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_style_requests}).execute()
+            except Exception as e:
+                print(f"テキストスタイル適用エラー（無視）: {e}")
 
         # === Step 3: テーブル挿入（末尾から逆順） ===
 
