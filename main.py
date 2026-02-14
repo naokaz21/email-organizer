@@ -484,18 +484,11 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
             'report': '相場調査に失敗しました。'
         }
 
-def research_area_with_perplexity(location: dict, property_info: dict, perplexity_client) -> dict:
-    """Perplexity APIでエリア調査（人口動態、ハザードマップ、再開発計画）"""
-    if not perplexity_client:
-        return {
-            'status': 'error',
-            'error': 'Perplexity client not available',
-            'report': 'エリア調査をスキップしました（Perplexity APIクライアントなし）'
-        }
-
+def research_area_with_gemini_search(location: dict, property_info: dict, gemini_client) -> dict:
+    """Gemini Web Search（Google Search grounding）でエリア調査"""
     try:
         prompt = f"""
-あなたは不動産投資エリア分析の専門家です。以下の物件エリアについて最新情報を調査してください。
+あなたは不動産投資エリア分析の専門家です。以下の物件エリアについてWeb検索で最新情報を調査してください。
 
 物件情報:
 - 住所: {location['formatted_address']}
@@ -508,12 +501,10 @@ def research_area_with_perplexity(location: dict, property_info: dict, perplexit
   - 最寄駅（{property_info.get('station', '不明')}駅）の1日あたりの乗降客数（最新データ）
   - 過去5年の乗降客数推移
   - 利用可能な路線名
-  - 出典URL
 
 2. 路線価
   - 物件所在地（{location['formatted_address']}）付近の路線価（最新年度）
   - 過去5年の路線価推移（上昇/下降トレンド）
-  - 出典URL（国税庁路線価図等）
 
 3. 人口動態
   - 過去10年の人口推移
@@ -525,37 +516,33 @@ def research_area_with_perplexity(location: dict, property_info: dict, perplexit
   - 洪水リスク（浸水想定区域）
   - 地震リスク（液状化、活断層）
   - 土砂災害リスク
-  - 公式ハザードマップのURL
 
 5. 再開発計画
   - 周辺の大規模開発プロジェクト
   - 新駅・路線延伸計画
   - 商業施設・インフラ整備
-  - 公式発表のURL
 
-重要: 必ず出典URLを記載してください。2024年以降の最新情報を優先してください。
+重要: 可能な限り出典URLを記載してください。最新情報を優先してください。
 プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
-見出しには番号を付けて区別してください（例: 「1. 人口動態」）。
+見出しには番号を付けて区別してください（例: 「1. 最寄駅情報」）。
 """
 
-        response = perplexity_client.chat.completions.create(
-            model="sonar",  # Perplexityの標準モデル
-            messages=[
-                {"role": "system", "content": "あなたは不動産投資エリア分析の専門家です。最新の公開情報に基づいて正確な調査を行います。"},
-                {"role": "user", "content": prompt}
-            ]
+        from google.generativeai.types import content_types
+        response = gemini_client.generate_content(
+            prompt,
+            tools='google_search_retrieval'
         )
 
-        report_text = response.choices[0].message.content
+        report_text = response.text
 
         return {
             'status': 'success',
             'report': report_text,
-            'model': 'perplexity-sonar'
+            'model': 'gemini-2.5-flash-google-search'
         }
 
     except Exception as e:
-        print(f"Perplexityエリア調査エラー: {e}")
+        print(f"Gemini Web Searchエリア調査エラー: {e}")
         import traceback
         traceback.print_exc()
         return {
@@ -583,8 +570,8 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def combine_research_reports(gemini_market_report: dict, perplexity_area_report: dict) -> str:
-    """Gemini市場調査とPerplexityエリア調査を統合"""
+def combine_research_reports(gemini_market_report: dict, area_report: dict) -> str:
+    """Gemini市場調査とエリア調査を統合"""
     combined_parts = []
 
     # Gemini市場調査
@@ -597,12 +584,11 @@ def combine_research_reports(gemini_market_report: dict, perplexity_area_report:
 
     combined_parts.append("")
 
-    # Perplexityエリア調査
-    if perplexity_area_report.get('status') == 'success':
+    # エリア調査（Gemini Web Search）
+    if area_report.get('status') == 'success':
         combined_parts.append("【エリア分析】")
-        combined_parts.append(perplexity_area_report.get('report', ''))
+        combined_parts.append(area_report.get('report', ''))
     else:
-        # Perplexity失敗時はスキップ（graceful degradation）
         combined_parts.append("【エリア分析】")
         combined_parts.append("エリア分析をスキップしました。")
 
@@ -814,9 +800,12 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
             pass
 
 
-def _insert_map_image(docs_service, doc_id, location):
-    """地図画像をプレースホルダー位置に挿入"""
+def _insert_map_image(docs_service, drive_service, doc_id, location):
+    """地図画像をDrive経由でプレースホルダー位置に挿入"""
     try:
+        import requests as req
+        from googleapiclient.http import MediaIoBaseUpload
+
         start, end = _find_placeholder_range(docs_service, doc_id, '{{MAP_IMAGE}}')
         if start is None:
             print("地図プレースホルダー未検出")
@@ -831,13 +820,33 @@ def _insert_map_image(docs_service, doc_id, location):
         lat, lng = location['lat'], location['lng']
         api_key = get_secret("GOOGLE_MAPS_API_KEY")
 
-        # Google Maps Static API URL
+        # Google Maps Static API で画像ダウンロード
         map_url = (
             f"https://maps.googleapis.com/maps/api/staticmap"
             f"?center={lat},{lng}&zoom=15&size=600x400&scale=2&maptype=roadmap"
             f"&markers=color:red%7C{lat},{lng}"
             f"&key={api_key}"
         )
+        resp = req.get(map_url, timeout=15)
+        if resp.status_code != 200:
+            print(f"地図画像ダウンロード失敗: HTTP {resp.status_code}")
+            return
+
+        # Driveにアップロード
+        image_data = io.BytesIO(resp.content)
+        media = MediaIoBaseUpload(image_data, mimetype='image/png', resumable=False)
+        map_file = drive_service.files().create(
+            body={'name': 'map_temp.png', 'mimeType': 'image/png'},
+            media_body=media, fields='id'
+        ).execute()
+        map_file_id = map_file['id']
+
+        # 公開URLを設定（anyone can view）
+        drive_service.permissions().create(
+            fileId=map_file_id,
+            body={'type': 'anyone', 'role': 'reader'}
+        ).execute()
+        image_url = f"https://drive.google.com/uc?id={map_file_id}"
 
         # Google Mapsリンク
         maps_link = f"https://www.google.com/maps?q={lat},{lng}"
@@ -847,7 +856,7 @@ def _insert_map_image(docs_service, doc_id, location):
             documentId=doc_id,
             body={'requests': [{
                 'insertInlineImage': {
-                    'uri': map_url,
+                    'uri': image_url,
                     'location': {'index': start},
                     'objectSize': {
                         'width': {'magnitude': 450, 'unit': 'PT'},
@@ -858,10 +867,7 @@ def _insert_map_image(docs_service, doc_id, location):
         ).execute()
 
         # 画像の後にリンクテキストを追加
-        doc = docs_service.documents().get(documentId=doc_id).execute()
-        # 画像挿入後のインデックスを取得（画像の直後）
         link_text = f"\nGoogle Mapsで開く\n"
-        # 画像は1文字分のインデックスを占める
         link_index = start + 1
 
         docs_service.documents().batchUpdate(
@@ -1192,7 +1198,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
 
         # 地図画像挿入
         if location and location.get('lat') and location.get('lng'):
-            _insert_map_image(docs_service, doc_id, location)
+            _insert_map_image(docs_service, drive_service, doc_id, location)
 
         # ドキュメントを物件フォルダに移動
         file = drive_service.files().get(fileId=doc_id, fields='parents').execute()
@@ -1279,17 +1285,9 @@ def generate_property_evaluation_report(
         market_data = research_market_price(location, property_info, gemini_client)
         print(f"相場調査完了: {market_data['status']}")
 
-        # 5.5. エリア調査（Perplexity）
-        perplexity_client = get_perplexity_client()
-        if perplexity_client:
-            area_data = research_area_with_perplexity(location, property_info, perplexity_client)
-            print(f"エリア調査完了: {area_data['status']}")
-        else:
-            area_data = {
-                'status': 'error',
-                'report': 'Perplexity APIクライアント初期化失敗'
-            }
-            print("エリア調査スキップ（Perplexity未設定）")
+        # 5.5. エリア調査（Gemini Web Search）
+        area_data = research_area_with_gemini_search(location, property_info, gemini_client)
+        print(f"エリア調査完了: {area_data['status']}")
 
         # 両方の調査結果を統合
         combined_report = combine_research_reports(market_data, area_data)
