@@ -1348,34 +1348,65 @@ def test_folder(folder_id):
         if not files:
             return jsonify({"status": "error", "message": "PDF/画像ファイルが見つかりません"}), 404
 
-        # 買付書(Kaitsuke_)を除外し、販売図面を優先
-        non_kaitsuke = [f for f in files if not f['name'].lower().startswith('kaitsuke')]
-        target = non_kaitsuke[0] if non_kaitsuke else files[0]
-        print(f"対象ファイル: {target['name']}")
-
-        # ファイルダウンロード
+        # 全ファイルを試して販売図面を探す
         from googleapiclient.http import MediaIoBaseDownload
-        request = drive.files().get_media(fileId=target['id'])
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        file_data = fh.getvalue()
-        print(f"ダウンロード完了: {len(file_data):,} bytes")
-
-        # テキスト抽出
         gemini_client = get_gemini_client()
-        is_pdf = target['name'].lower().endswith('.pdf')
-        if is_pdf:
-            extracted_text = extract_text_from_pdf(file_data)
-        else:
-            extracted_text = extract_text_from_image(file_data, gemini_client)
-        print(f"テキスト抽出: {len(extracted_text)} 文字")
+        target = None
+        file_data = None
+        extracted_text = ''
+        is_sales = False
 
-        # 販売図面判定
-        is_sales = is_hanbaizumen(extracted_text)
-        print(f"販売図面判定: {is_sales}")
+        # 買付書・地図を後回しにソート
+        def sort_key(f):
+            name = f['name'].lower()
+            if name.startswith('kaitsuke') or name.startswith('map'):
+                return 1
+            return 0
+        sorted_files = sorted(files, key=sort_key)
+
+        for candidate in sorted_files:
+            print(f"ファイル確認中: {candidate['name']}")
+            req = drive.files().get_media(fileId=candidate['id'])
+            fh = io.BytesIO()
+            dl = MediaIoBaseDownload(fh, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            candidate_data = fh.getvalue()
+
+            is_pdf = candidate['name'].lower().endswith('.pdf')
+            if is_pdf:
+                candidate_text = extract_text_from_pdf(candidate_data)
+            else:
+                candidate_text = extract_text_from_image(candidate_data, gemini_client)
+
+            if is_hanbaizumen(candidate_text):
+                target = candidate
+                file_data = candidate_data
+                extracted_text = candidate_text
+                is_sales = True
+                print(f"販売図面発見: {candidate['name']}")
+                break
+            print(f"  → 販売図面ではない ({len(candidate_text)}文字)")
+
+        # 販売図面が見つからない場合は最初のファイルを使用
+        if target is None:
+            target = sorted_files[0]
+            req = drive.files().get_media(fileId=target['id'])
+            fh = io.BytesIO()
+            dl = MediaIoBaseDownload(fh, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            file_data = fh.getvalue()
+            is_pdf_fallback = target['name'].lower().endswith('.pdf')
+            if is_pdf_fallback:
+                extracted_text = extract_text_from_pdf(file_data)
+            else:
+                extracted_text = extract_text_from_image(file_data, gemini_client)
+            print(f"販売図面なし、フォールバック: {target['name']}")
+
+        print(f"対象ファイル: {target['name']} (販売図面: {is_sales})")
 
         # 包括的データ抽出
         comprehensive_data = extract_comprehensive_property_data(file_data, target['name'], gemini_client)
