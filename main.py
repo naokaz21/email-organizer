@@ -15,6 +15,7 @@ import io
 from pypdf import PdfReader
 import google.generativeai as genai
 import googlemaps
+from simulation import run_simulation, create_simulation_excel, format_simulation_summary_for_report
 
 app = Flask(__name__)
 
@@ -640,6 +641,11 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         content_parts.append("【相場調査】")
         content_parts.append(report_data.get('market_report', ''))
 
+        # 投資シミュレーション結果
+        sim_result = detailed.get('simulation_result')
+        sim_lines = format_simulation_summary_for_report(sim_result)
+        content_parts.extend(sim_lines)
+
         content_parts.append("")
         content_parts.append(f"作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1107,6 +1113,29 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
                                     file_data, filename, gemini_client
                                 )
                                 print(f"詳細データ抽出完了: {len(comprehensive_data)} フィールド")
+
+                                # 投資シミュレーション実行
+                                simulation_result = None
+                                try:
+                                    simulation_result = run_simulation(comprehensive_data)
+                                    if simulation_result:
+                                        print(f"投資シミュレーション完了: {simulation_result['decision']['recommendation']}")
+                                        excel_file_id = create_simulation_excel(
+                                            simulation_result,
+                                            {"property_number": property_number, "station": station},
+                                            drive, folder_id
+                                        )
+                                        if excel_file_id:
+                                            print(f"シミュレーションExcel保存完了: {excel_file_id}")
+                                    else:
+                                        print("投資シミュレーションスキップ（データ不足）")
+                                except Exception as sim_e:
+                                    print(f"投資シミュレーションエラー（処理継続）: {sim_e}")
+                                    import traceback
+                                    traceback.print_exc()
+
+                                if simulation_result:
+                                    comprehensive_data['simulation_result'] = simulation_result
 
                                 # レポート生成（extracted_textと詳細データを渡す）
                                 report_doc_id = generate_property_evaluation_report(
