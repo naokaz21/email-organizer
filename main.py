@@ -575,96 +575,286 @@ def combine_research_reports(gemini_market_report: dict, perplexity_area_report:
 
     return "\n".join(combined_parts)
 
+def _find_placeholder_index(docs_service, doc_id, placeholder):
+    """ドキュメント内のプレースホルダー文字列のインデックスを検索"""
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    for element in doc['body']['content']:
+        if 'paragraph' in element:
+            for run in element['paragraph'].get('elements', []):
+                text = run.get('textRun', {}).get('content', '')
+                if placeholder in text:
+                    return run['startIndex']
+    return None
+
+
+def _find_placeholder_range(docs_service, doc_id, placeholder):
+    """プレースホルダー行全体のstart/endインデックスを返す"""
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    for element in doc['body']['content']:
+        if 'paragraph' in element:
+            full_text = ''
+            for run in element['paragraph'].get('elements', []):
+                full_text += run.get('textRun', {}).get('content', '')
+            if placeholder in full_text:
+                return element['startIndex'], element['endIndex']
+    return None, None
+
+
+def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, col_count):
+    """プレースホルダーをテーブルに置換し、セルにデータを入力"""
+    start, end = _find_placeholder_range(docs_service, doc_id, placeholder)
+    if start is None:
+        print(f"プレースホルダー未検出: {placeholder}")
+        return
+
+    # プレースホルダー行を削除
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={'requests': [{'deleteContentRange': {'range': {'startIndex': start, 'endIndex': end}}}]}
+    ).execute()
+
+    # テーブル挿入
+    row_count = len(rows_data)
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={'requests': [{'insertTable': {
+            'rows': row_count, 'columns': col_count,
+            'location': {'index': start}
+        }}]}
+    ).execute()
+
+    # ドキュメント再取得してテーブルセルのインデックスを取得
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    table = None
+    for element in doc['body']['content']:
+        if 'table' in element and element['startIndex'] >= start:
+            table = element['table']
+            break
+
+    if not table:
+        print(f"テーブル未検出: {placeholder}")
+        return
+
+    # セルにデータを入力（逆順でインデックスずれ防止）
+    cell_requests = []
+    for r in range(row_count - 1, -1, -1):
+        row = table['tableRows'][r]
+        for c in range(col_count - 1, -1, -1):
+            cell = row['tableCells'][c]
+            cell_index = cell['content'][0]['paragraph']['elements'][0]['startIndex']
+            text = str(rows_data[r][c]) if c < len(rows_data[r]) else ''
+            if text:
+                cell_requests.append({'insertText': {'location': {'index': cell_index}, 'text': text}})
+
+    if cell_requests:
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': cell_requests}
+        ).execute()
+
+    # ヘッダー行（1行目）を太字にする
+    header_row = table['tableRows'][0]
+    bold_requests = []
+    for c in range(col_count):
+        cell = header_row['tableCells'][c]
+        cell_start = cell['content'][0]['paragraph']['elements'][0]['startIndex']
+        cell_end = cell['content'][0]['paragraph']['elements'][-1]['endIndex']
+        if cell_end > cell_start:
+            bold_requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': cell_start, 'endIndex': cell_end - 1},
+                    'textStyle': {'bold': True},
+                    'fields': 'bold'
+                }
+            })
+    if bold_requests:
+        try:
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={'requests': bold_requests}
+            ).execute()
+        except Exception:
+            pass  # ヘッダー太字は見た目のみなのでエラーは無視
+
+
 def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict) -> str:
-    """Google Docsでレポートを作成"""
+    """Google Docsで要件定義書サンプル準拠の構造化レポートを作成"""
     try:
         # ドキュメント作成
         title = f"物件評価レポート_{report_data['property_number']}_{report_data['station']}"
         doc = docs_service.documents().create(body={'title': title}).execute()
         doc_id = doc['documentId']
 
-        # 詳細データの取得
         detailed = report_data.get('detailed_data', {})
+        sim_result = detailed.get('simulation_result')
+        now = datetime.now().strftime('%Y年%m月%d日')
 
-        # コンテンツ作成
-        content_parts = [
-            "物件評価レポート",
-            "",
-            "【基本情報】",
-            f"物件番号: {report_data['property_number']}",
-            f"駅: {report_data['station']}",
-            f"住所: {report_data.get('address', '不明')}",
-            f"緯度経度: {report_data['location']['lat']}, {report_data['location']['lng']}"
-        ]
+        # === Step 1: テキスト部分を構築 ===
+        # 各セクションをリストで管理 (text, style) のペア
+        # style: 'TITLE', 'HEADING_1', 'HEADING_2', 'NORMAL_TEXT'
+        sections = []
 
-        # 価格・構造・築年月（詳細データから）
-        if detailed.get('price'):
-            content_parts.append(f"価格: {detailed['price']:,.0f}万円")
-        if detailed.get('structure'):
-            content_parts.append(f"構造: {detailed['structure']}")
-        if detailed.get('year_built'):
-            content_parts.append(f"築年月: {detailed['year_built']}")
+        # タイトル
+        sections.append((f"{report_data['station']}_{report_data['property_number']} 物件調査レポート", 'TITLE'))
+        sections.append((f"調査日：{now}", 'NORMAL_TEXT'))
 
-        content_parts.append("")
-        content_parts.append("【詳細情報】")
-
-        # 面積・戸数
-        if detailed.get('land_area'):
-            content_parts.append(f"土地面積: {detailed['land_area']:,.2f}㎡")
-        if detailed.get('building_area'):
-            content_parts.append(f"建物面積: {detailed['building_area']:,.2f}㎡")
-        if detailed.get('total_units'):
-            content_parts.append(f"総戸数: {int(detailed['total_units'])}戸")
-
-        # 賃料・管理費等
-        if detailed.get('full_occupancy_rent'):
-            content_parts.append(f"満室時賃料: {detailed['full_occupancy_rent']:,.0f}円/月")
-        if detailed.get('floor_plan'):
-            content_parts.append(f"間取り: {detailed['floor_plan']}")
-        if detailed.get('management_fee'):
-            content_parts.append(f"管理費: {detailed['management_fee']:,.0f}円/月")
-        if detailed.get('reserve_fund'):
-            content_parts.append(f"修繕積立金: {detailed['reserve_fund']:,.0f}円/月")
+        # A1. 物件概要
+        sections.append(("A1. 物件概要", 'HEADING_1'))
+        sections.append(("基本情報", 'HEADING_2'))
+        sections.append(("{{TABLE_BASIC_INFO}}", 'NORMAL_TEXT'))
 
         # レントロール
         if detailed.get('rent_roll') and len(detailed['rent_roll']) > 0:
-            content_parts.append("")
-            content_parts.append("【レントロール】")
+            sections.append(("レントロール", 'HEADING_2'))
+            sections.append(("{{TABLE_RENT_ROLL}}", 'NORMAL_TEXT'))
+
+        # A2. 周辺環境調査
+        sections.append(("A2. 周辺環境調査", 'HEADING_1'))
+        market_text = report_data.get('market_report', '調査データなし')
+        sections.append((market_text, 'NORMAL_TEXT'))
+
+        # A3. 収益シミュレーション概要
+        sections.append(("A3. 収益シミュレーション概要", 'HEADING_1'))
+        if sim_result:
+            sections.append(("主要設定条件", 'HEADING_2'))
+            sections.append(("{{TABLE_SIM_CONDITIONS}}", 'NORMAL_TEXT'))
+            sections.append(("投資分析結果", 'HEADING_2'))
+            sections.append(("{{TABLE_SIM_RESULTS}}", 'NORMAL_TEXT'))
+        else:
+            sections.append(("シミュレーション実行不可（データ不足）", 'NORMAL_TEXT'))
+
+        # A4. 投資判断コメント
+        sections.append(("A4. 投資判断コメント", 'HEADING_1'))
+        if sim_result:
+            d = sim_result['decision']
+            m = sim_result['metrics']
+            judgment_lines = []
+            judgment_lines.append(f"総合判定: {d['recommendation']}（{d['pass_count']}/{d['total_count']}項目クリア）")
+            judgment_lines.append("")
+            for key, item in d['decisions'].items():
+                mark = "○" if item['pass'] else "×"
+                judgment_lines.append(f"  {mark} {item['label']}: {item['detail']}")
+            if sim_result.get('warnings'):
+                judgment_lines.append("")
+                judgment_lines.append("※ 注意事項:")
+                for w in sim_result['warnings']:
+                    judgment_lines.append(f"  - {w}")
+            sections.append(("\n".join(judgment_lines), 'NORMAL_TEXT'))
+        else:
+            sections.append(("データ不足のため投資判断不可", 'NORMAL_TEXT'))
+
+        # 免責事項
+        sections.append(("", 'NORMAL_TEXT'))
+        sections.append(("※ 本レポートは投資判断の参考情報であり、最終的な投資判断はご自身の責任において行ってください。", 'NORMAL_TEXT'))
+        sections.append((f"作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 'NORMAL_TEXT'))
+
+        # === Step 2: テキスト一括挿入 + スタイル適用 ===
+        full_text = "\n".join(s[0] for s in sections)
+        requests = [{'insertText': {'location': {'index': 1}, 'text': full_text}}]
+        docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+
+        # スタイル適用
+        style_requests = []
+        idx = 1  # ドキュメントのインデックスは1から
+        for text, style in sections:
+            end_idx = idx + len(text)
+            if style != 'NORMAL_TEXT':
+                style_requests.append({
+                    'updateParagraphStyle': {
+                        'range': {'startIndex': idx, 'endIndex': end_idx},
+                        'paragraphStyle': {'namedStyleType': style},
+                        'fields': 'namedStyleType'
+                    }
+                })
+            idx = end_idx + 1  # +1 for \n separator
+
+        if style_requests:
+            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+
+        # === Step 3: テーブル挿入（末尾から逆順） ===
+
+        # 投資分析結果テーブル
+        if sim_result:
+            p = sim_result['params']
+            m = sim_result['metrics']
+            d = sim_result['decision']
+
+            def mark(passed):
+                return "○" if passed else "×"
+
+            sim_results_data = [
+                ["指標", "算出値", "判断基準"],
+                ["表面利回り", f"{m['gross_yield']:.2%}", "参考値"],
+                ["FCR（総収益率）", f"{m['fcr']:.2%}", f"FCR > K% → {mark(d['decisions']['fcr_vs_k']['pass'])}"],
+                ["K%（ローン定数）", f"{m['k_percent']:.2%}", "参考値"],
+                ["CCR（自己資本配当率）", f"{m['ccr']:.2%}", f"CCR > FCR → {mark(d['decisions']['ccr_vs_fcr']['pass'])}"],
+                ["レバレッジ分析", m['leverage'], f"{mark(d['decisions']['ccr_vs_fcr']['pass'])}"],
+                ["DCR（借入償還余裕率）", f"{m['dcr']:.2f}", f"DCR ≥ 1.2 → {mark(d['decisions']['dcr']['pass'])}"],
+                ["BER（損益分岐入居率）", f"{m['ber']:.2%}", f"BER ≤ 80% → {mark(d['decisions']['ber']['pass'])}"],
+            ]
+            if m.get('irr') is not None:
+                sim_results_data.append(["IRR（内部収益率）", f"{m['irr']:.2%}", f"IRR > 期待収益率 → {mark(d['decisions']['irr']['pass'])}"])
+            else:
+                sim_results_data.append(["IRR（内部収益率）", "計算不可", "×"])
+            if m.get('npv') is not None:
+                sim_results_data.append(["NPV（正味現在価値）", f"¥{m['npv']:,.0f}", f"NPV > 0 → {mark(d['decisions']['npv']['pass'])}"])
+            else:
+                sim_results_data.append(["NPV（正味現在価値）", "計算不可", "×"])
+
+            _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_SIM_RESULTS}}', sim_results_data, 3)
+
+            # 設定条件テーブル
+            sim_cond_data = [
+                ["条件", "値"],
+                ["物件購入価格", f"¥{p['purchase_price']:,.0f}"],
+                ["購入諸費用（約8%）", f"¥{p['purchase_expenses']:,.0f}"],
+                ["購入総費用", f"¥{p['total_purchase_cost']:,.0f}"],
+                ["LTV（借入割合）", f"{p['ltv']:.0%}"],
+                ["ローン総額", f"¥{p['loan_amount']:,.0f}"],
+                ["自己資金", f"¥{p['equity']:,.0f}"],
+                ["ローン金利", f"{p['interest_rate']:.3%}"],
+                ["返済期間", f"{p['loan_term']}年（元利均等）"],
+                ["空室率", f"{p.get('vacancy_rate', 0.05):.0%}"],
+                ["保有期間", f"{p.get('holding_period', 10)}年"],
+            ]
+            _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_SIM_CONDITIONS}}', sim_cond_data, 2)
+
+        # レントロールテーブル
+        if detailed.get('rent_roll') and len(detailed['rent_roll']) > 0:
+            rent_data = [["部屋番号", "間取り・広さ", "想定賃料（月額）"]]
             for unit in detailed['rent_roll']:
-                room = unit.get('room_number', '不明')
+                room = unit.get('room', unit.get('room_number', '不明'))
+                plan = unit.get('plan', unit.get('floor_plan', ''))
+                area = unit.get('area', '')
+                plan_area = f"{plan}" + (f"（{area}畳）" if area else "")
                 rent = unit.get('rent', 0)
-                status = unit.get('status', '不明')
-                content_parts.append(f"  {room}: {rent:,.0f}円/月 ({status})")
+                rent_data.append([str(room), plan_area, f"¥{rent:,.0f}"])
+            _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_RENT_ROLL}}', rent_data, 3)
 
-        # 相場調査
-        content_parts.append("")
-        content_parts.append("【相場調査】")
-        content_parts.append(report_data.get('market_report', ''))
+        # 基本情報テーブル
+        basic_rows = [["項目", "内容"]]
+        basic_rows.append(["所在地", report_data.get('address', '不明')])
+        basic_rows.append(["最寄駅", report_data['station']])
+        if detailed.get('price'):
+            basic_rows.append(["物件価格", f"¥{detailed['price']:,.0f}"])
+        if detailed.get('structure'):
+            basic_rows.append(["構造", detailed['structure']])
+        if detailed.get('year_built'):
+            basic_rows.append(["築年月", str(detailed['year_built'])])
+        if detailed.get('land_area'):
+            basic_rows.append(["土地面積", f"{detailed['land_area']}㎡"])
+        if detailed.get('building_area'):
+            basic_rows.append(["建物面積", f"{detailed['building_area']}㎡"])
+        if detailed.get('total_units'):
+            basic_rows.append(["総戸数", f"{int(detailed['total_units'])}戸"])
+        if detailed.get('full_occupancy_rent'):
+            basic_rows.append(["満室時賃料", f"月額¥{detailed['full_occupancy_rent']:,.0f}（年額¥{detailed['full_occupancy_rent'] * 12:,.0f}）"])
+        if detailed.get('floor_plan'):
+            basic_rows.append(["間取り", detailed['floor_plan']])
+        if sim_result:
+            basic_rows.append(["表面利回り", f"{sim_result['metrics']['gross_yield']:.2%}"])
 
-        # 投資シミュレーション結果
-        sim_result = detailed.get('simulation_result')
-        sim_lines = format_simulation_summary_for_report(sim_result)
-        content_parts.extend(sim_lines)
-
-        content_parts.append("")
-        content_parts.append(f"作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        content = "\n".join(content_parts)
-
-        # テキスト挿入
-        requests = [
-            {
-                'insertText': {
-                    'location': {'index': 1},
-                    'text': content
-                }
-            }
-        ]
-
-        docs_service.documents().batchUpdate(
-            documentId=doc_id,
-            body={'requests': requests}
-        ).execute()
+        _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_BASIC_INFO}}', basic_rows, 2)
 
         # ドキュメントを物件フォルダに移動
         file = drive_service.files().get(fileId=doc_id, fields='parents').execute()
