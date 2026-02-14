@@ -527,11 +527,7 @@ def research_area_with_gemini_search(location: dict, property_info: dict, gemini
 見出しには番号を付けて区別してください（例: 「1. 最寄駅情報」）。
 """
 
-        from google.generativeai.types import content_types
-        response = gemini_client.generate_content(
-            prompt,
-            tools='google_search_retrieval'
-        )
+        response = gemini_client.generate_content(prompt)
 
         report_text = response.text
 
@@ -800,8 +796,35 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
             pass
 
 
-def _insert_map_image(docs_service, drive_service, doc_id, location):
-    """地図画像をDrive経由でプレースホルダー位置に挿入"""
+def _search_nearby_places(gmaps_client, lat, lng):
+    """googlemapsクライアントで周辺施設を検索"""
+    markers = []
+    place_types = [
+        ('convenience_store', 'blue', 'C'),
+        ('supermarket', 'green', 'S'),
+        ('restaurant', 'orange', 'R'),
+    ]
+    for place_type, color, label in place_types:
+        try:
+            results = gmaps_client.places_nearby(
+                location=(lat, lng),
+                radius=800,
+                type=place_type,
+                language='ja'
+            )
+            places = results.get('results', [])[:3]
+            for place in places:
+                plat = place['geometry']['location']['lat']
+                plng = place['geometry']['location']['lng']
+                markers.append((plat, plng, color, label))
+            print(f"周辺施設検索({place_type}): {len(places)}件")
+        except Exception as e:
+            print(f"周辺施設検索エラー({place_type}): {e}")
+    return markers
+
+
+def _insert_map_image(docs_service, drive_service, doc_id, location, gmaps_client=None):
+    """地図画像をDrive経由でプレースホルダー位置に挿入（周辺施設マーカー付き）"""
     try:
         import requests as req
         from googleapiclient.http import MediaIoBaseUpload
@@ -820,16 +843,25 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         lat, lng = location['lat'], location['lng']
         api_key = get_secret("GOOGLE_MAPS_API_KEY")
 
-        # Google Maps Static API で画像ダウンロード
+        # 周辺施設を検索
+        nearby = []
+        if gmaps_client:
+            nearby = _search_nearby_places(gmaps_client, lat, lng)
+
+        # Google Maps Static API で画像ダウンロード（周辺施設マーカー付き）
         map_url = (
             f"https://maps.googleapis.com/maps/api/staticmap"
             f"?center={lat},{lng}&zoom=15&size=600x400&scale=2&maptype=roadmap"
-            f"&markers=color:red%7C{lat},{lng}"
+            f"&markers=color:red%7Clabel:P%7C{lat},{lng}"
             f"&key={api_key}"
         )
+        # 周辺施設マーカーを追加
+        for plat, plng, color, label in nearby:
+            map_url += f"&markers=color:{color}%7Clabel:{label}%7C{plat},{plng}"
+
         resp = req.get(map_url, timeout=15)
         if resp.status_code != 200:
-            print(f"地図画像ダウンロード失敗: HTTP {resp.status_code}")
+            print(f"地図画像ダウンロード失敗: HTTP {resp.status_code}, body={resp.text[:500]}")
             return
 
         # Driveにアップロード
@@ -866,16 +898,31 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
             }]}
         ).execute()
 
-        # 画像の後にリンクテキストを追加
-        link_text = f"\nGoogle Mapsで開く\n"
+        # 画像の後に凡例とリンクテキストを追加
+        legend_text = "\nP=物件  C=コンビニ  S=スーパー  R=レストラン\n"
+        link_label = "Google Mapsで開く"
+        full_text = legend_text + link_label + "\n"
         link_index = start + 1
 
         docs_service.documents().batchUpdate(
             documentId=doc_id,
             body={'requests': [
-                {'insertText': {'location': {'index': link_index}, 'text': link_text}},
+                {'insertText': {'location': {'index': link_index}, 'text': full_text}},
+                # 凡例テキストのスタイル
                 {'updateTextStyle': {
-                    'range': {'startIndex': link_index + 1, 'endIndex': link_index + 1 + len("Google Mapsで開く")},
+                    'range': {'startIndex': link_index, 'endIndex': link_index + len(legend_text)},
+                    'textStyle': {
+                        'foregroundColor': _rgb({'red': 0.45, 'green': 0.45, 'blue': 0.45}),
+                        'fontSize': {'magnitude': 8, 'unit': 'PT'},
+                    },
+                    'fields': 'foregroundColor,fontSize'
+                }},
+                # リンクテキストのスタイル
+                {'updateTextStyle': {
+                    'range': {
+                        'startIndex': link_index + len(legend_text),
+                        'endIndex': link_index + len(legend_text) + len(link_label)
+                    },
                     'textStyle': {
                         'link': {'url': maps_link},
                         'foregroundColor': _rgb(_ACCENT),
@@ -886,12 +933,153 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
             ]}
         ).execute()
 
-        print(f"地図画像挿入完了")
+        print(f"地図画像挿入完了（周辺施設{len(nearby)}件）")
 
     except Exception as e:
         print(f"地図画像挿入エラー（無視）: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _insert_sales_drawing(docs_service, drive_service, doc_id, pdf_file_id, filename):
+    """販売図面画像をプレースホルダー位置に挿入"""
+    try:
+        start, end = _find_placeholder_range(docs_service, doc_id, '{{SALES_DRAWING}}')
+        if start is None:
+            print("販売図面プレースホルダー未検出")
+            return
+
+        # プレースホルダー削除
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': [{'deleteContentRange': {'range': {'startIndex': start, 'endIndex': end}}}]}
+        ).execute()
+
+        is_image = filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp'))
+
+        if is_image:
+            # 画像ファイル: そのままDriveから公開URL取得して挿入
+            drive_service.permissions().create(
+                fileId=pdf_file_id,
+                body={'type': 'anyone', 'role': 'reader'}
+            ).execute()
+            image_url = f"https://drive.google.com/uc?id={pdf_file_id}"
+        else:
+            # PDF: サムネイル画像を取得してDriveにアップロード
+            from googleapiclient.http import MediaIoBaseUpload
+            file_meta = drive_service.files().get(
+                fileId=pdf_file_id, fields='thumbnailLink'
+            ).execute()
+            thumbnail_link = file_meta.get('thumbnailLink')
+
+            if not thumbnail_link:
+                print("販売図面サムネイル取得不可")
+                return
+
+            # サムネイルを大きいサイズで取得
+            thumbnail_link = thumbnail_link.replace('=s220', '=s1600')
+            import requests as req
+            resp = req.get(thumbnail_link, timeout=15)
+            if resp.status_code != 200:
+                print(f"販売図面サムネイルダウンロード失敗: HTTP {resp.status_code}")
+                return
+
+            thumb_data = io.BytesIO(resp.content)
+            media = MediaIoBaseUpload(thumb_data, mimetype='image/png', resumable=False)
+            thumb_file = drive_service.files().create(
+                body={'name': 'sales_drawing_thumb.png', 'mimeType': 'image/png'},
+                media_body=media, fields='id'
+            ).execute()
+            thumb_file_id = thumb_file['id']
+
+            drive_service.permissions().create(
+                fileId=thumb_file_id,
+                body={'type': 'anyone', 'role': 'reader'}
+            ).execute()
+            image_url = f"https://drive.google.com/uc?id={thumb_file_id}"
+
+        # 画像挿入
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': [{
+                'insertInlineImage': {
+                    'uri': image_url,
+                    'location': {'index': start},
+                    'objectSize': {
+                        'width': {'magnitude': 450, 'unit': 'PT'},
+                        'height': {'magnitude': 600, 'unit': 'PT'},
+                    }
+                }
+            }]}
+        ).execute()
+
+        print(f"販売図面画像挿入完了: {filename}")
+
+    except Exception as e:
+        print(f"販売図面画像挿入エラー（無視）: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _generate_investment_advice(gemini_client, sim_result, detailed_data):
+    """Geminiを使って具体的な投資判断アドバイスを生成"""
+    try:
+        p = sim_result['params']
+        m = sim_result['metrics']
+        d = sim_result['decision']
+
+        prompt = f"""あなたは不動産投資アドバイザーです。以下のシミュレーション結果に基づき、
+この物件が投資適格になるための具体的な条件を分析してください。
+
+物件情報:
+- 所在地: {detailed_data.get('address', '不明')}
+- 物件価格: {p['purchase_price']:,.0f}円
+- 満室時賃料: 年額{p.get('gpi', 0):,.0f}円
+- 構造: {detailed_data.get('structure', '不明')}
+- 築年: {detailed_data.get('year_built', '不明')}
+
+現在のシミュレーション結果:
+- 表面利回り: {m['gross_yield']:.2%}
+- FCR（総収益率）: {m['fcr']:.2%}
+- K%（ローン定数）: {m['k_percent']:.2%}
+- CCR（自己資本配当率）: {m['ccr']:.2%}
+- レバレッジ効果: {m['leverage']}
+- DCR（借入償還余裕率）: {m['dcr']:.2f}
+- BER（損益分岐入居率）: {m['ber']:.2%}
+- IRR: {f"{m['irr']:.2%}" if m.get('irr') is not None else "計算不可"}
+- NPV: {f"{m['npv']:,.0f}円" if m.get('npv') is not None else "計算不可"}
+
+融資条件:
+- LTV: {p['ltv']:.0%}
+- 金利: {p['interest_rate']:.3%}
+- 返済期間: {p['loan_term']}年
+- 借入額: {p['loan_amount']:,.0f}円
+
+判定結果: {d['recommendation']}（{d['pass_count']}/{d['total_count']}項目クリア）
+
+以下を具体的な数値とともに述べてください:
+
+1. 総合評価（2-3文で簡潔に）
+
+2. 投資適格ラインへの条件（不合格項目がある場合）
+   - 物件価格がいくらまで下がれば各指標をクリアできるか
+   - 金利が何%以下になれば改善するか
+   - 返済期間を何年にすれば改善するか
+   - その他の改善方法
+
+3. リスク要因と注意点
+
+4. 投資判断の結論（買い/見送り/条件付き検討 のいずれか）
+
+プレーンテキストで出力してください。マークダウン記法は使わないでください。
+見出しには番号を付けて区別してください。各項目は改行で区切ってください。
+"""
+        response = gemini_client.generate_content(prompt)
+        return _strip_markdown(response.text)
+
+    except Exception as e:
+        print(f"投資判断アドバイス生成エラー: {e}")
+        return None
 
 
 def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict) -> str:
@@ -919,6 +1107,11 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         sections.append(("A1. 物件概要", 'HEADING_1'))
         sections.append(("基本情報", 'HEADING_2'))
         sections.append(("{{TABLE_BASIC_INFO}}", 'NORMAL_TEXT'))
+
+        # 販売図面
+        if report_data.get('pdf_file_id'):
+            sections.append(("販売図面", 'HEADING_2'))
+            sections.append(("{{SALES_DRAWING}}", 'NORMAL_TEXT'))
 
         # 地図
         location = report_data.get('location')
@@ -951,6 +1144,8 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         if sim_result:
             d = sim_result['decision']
             m = sim_result['metrics']
+
+            # 判定結果サマリー
             judgment_lines = []
             judgment_lines.append(f"総合判定: {d['recommendation']}（{d['pass_count']}/{d['total_count']}項目クリア）")
             judgment_lines.append("")
@@ -963,6 +1158,14 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
                 for w in sim_result['warnings']:
                     judgment_lines.append(f"  - {w}")
             sections.append(("\n".join(judgment_lines), 'NORMAL_TEXT'))
+
+            # Gemini投資アドバイス
+            gemini_client = report_data.get('gemini_client')
+            if gemini_client:
+                advice = _generate_investment_advice(gemini_client, sim_result, detailed)
+                if advice:
+                    sections.append(("投資適格条件の分析", 'HEADING_2'))
+                    sections.append((advice, 'NORMAL_TEXT'))
         else:
             sections.append(("データ不足のため投資判断不可", 'NORMAL_TEXT'))
 
@@ -1198,7 +1401,14 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
 
         # 地図画像挿入
         if location and location.get('lat') and location.get('lng'):
-            _insert_map_image(docs_service, drive_service, doc_id, location)
+            _insert_map_image(docs_service, drive_service, doc_id, location,
+                              gmaps_client=report_data.get('gmaps_client'))
+
+        # 販売図面画像挿入
+        pdf_file_id = report_data.get('pdf_file_id')
+        pdf_filename = report_data.get('pdf_filename', '')
+        if pdf_file_id:
+            _insert_sales_drawing(docs_service, drive_service, doc_id, pdf_file_id, pdf_filename)
 
         # ドキュメントを物件フォルダに移動
         file = drive_service.files().get(fileId=doc_id, fields='parents').execute()
@@ -1229,7 +1439,8 @@ def generate_property_evaluation_report(
     property_number: str,
     station: str,
     extracted_text: Optional[str] = None,
-    detailed_data: Optional[dict] = None
+    detailed_data: Optional[dict] = None,
+    pdf_filename: Optional[str] = None
 ) -> Optional[str]:
     """物件評価レポートを生成するメインフロー"""
 
@@ -1299,7 +1510,11 @@ def generate_property_evaluation_report(
             'address': location['formatted_address'],
             'location': location,
             'market_report': combined_report,
-            'detailed_data': detailed_data or {}
+            'detailed_data': detailed_data or {},
+            'pdf_file_id': pdf_file_id,
+            'pdf_filename': pdf_filename or '',
+            'gemini_client': gemini_client,
+            'gmaps_client': gmaps_client,
         }
 
         doc_id = create_evaluation_report(docs_service, drive_service, folder_id, report_data)
@@ -1674,7 +1889,8 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
                                     property_number=property_number,
                                     station=station,
                                     extracted_text=extracted_text,
-                                    detailed_data=comprehensive_data
+                                    detailed_data=comprehensive_data,
+                                    pdf_filename=filename,
                                 )
 
                                 if report_doc_id:
@@ -1974,6 +2190,7 @@ def test_folder(folder_id):
             station=station,
             extracted_text=extracted_text,
             detailed_data=comprehensive_data,
+            pdf_filename=target['name'],
         )
 
         result = {
