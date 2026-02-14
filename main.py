@@ -560,23 +560,51 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
         station = property_info.get('station', '不明')
         walking_info = property_info.get('walking_distance')
         walking_desc = ""
+        walking_minutes = '不明'
         if walking_info:
-            walking_desc = f"\n- 最寄駅までの徒歩距離: {walking_info['distance_text']}（徒歩{walking_info['duration_minutes']}分）※Google Maps Distance Matrix APIによる実測値"
+            walking_minutes = walking_info['duration_minutes']
+            walking_desc = f"\n- 最寄駅までの徒歩距離: {walking_info['distance_text']}（徒歩{walking_minutes}分）※Google Maps Distance Matrix API実測値"
+
+        # 物件スペック情報を構築
+        spec_lines = []
+        if property_info.get('structure'):
+            spec_lines.append(f"- 構造: {property_info['structure']}")
+        if property_info.get('year_built'):
+            spec_lines.append(f"- 築年月: {property_info['year_built']}")
+        if property_info.get('floor_plan'):
+            spec_lines.append(f"- 間取り: {property_info['floor_plan']}")
+        if property_info.get('building_area'):
+            spec_lines.append(f"- 建物面積: {property_info['building_area']}㎡")
+        if property_info.get('total_units'):
+            spec_lines.append(f"- 総戸数: {int(property_info['total_units'])}戸")
+        spec_text = "\n".join(spec_lines)
+
         prompt = f"""
 あなたは不動産投資の専門家です。
 
 【重要】調査対象の物件住所: {address}
 【重要】調査対象の最寄駅: {station}駅
-【重要】上記の住所・駅の周辺の家賃相場を調査してください。他のエリアの情報は含めないでください。
+【重要】上記の住所・駅の周辺の家賃相場を調査してください。
+【重要】他の都道府県・市区町村の物件情報は絶対に含めないでください。{station}駅周辺の物件のみ対象です。
 
 物件情報:
 - 住所: {address}
 - 緯度経度: {location['lat']}, {location['lng']}
 - 駅: {station}{walking_desc}
 - 物件番号: {property_info.get('property_number')}
+{spec_text}
+
+【類似物件の検索条件（重要）】
+以下の条件をできる限り揃えた類似物件を挙げてください:
+1. エリア: {station}駅周辺（同一駅もしくは隣接駅、同じ都道府県内）
+2. 駅徒歩分数: 徒歩{walking_minutes}分前後（±5分以内）
+3. 築年数: {property_info.get('year_built', '不明')}前後（±10年以内）
+4. 専有面積: {property_info.get('building_area', '不明')}㎡前後
+5. 間取り: {property_info.get('floor_plan', '不明')}と同等
+6. 構造: {property_info.get('structure', '不明')}と同等
 
 【駅距離に関する注意】
-駅までの距離・徒歩時間について言及する場合は、上記のGoogle Maps実測値（徒歩{walking_info['duration_minutes'] if walking_info else '不明'}分）のみを使用してください。独自に推測した距離を記載しないでください。
+駅までの距離・徒歩時間について言及する場合は、上記のGoogle Maps実測値（徒歩{walking_minutes}分）のみを使用してください。独自に推測した距離を記載しないでください。
 
 以下の形式でレポートしてください（構造化フォーマットで出力）:
 
@@ -584,14 +612,14 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
 {address}周辺（{station}駅エリア）の特徴を記述してください。
 
 [HEADING]類似物件の家賃相場[/HEADING]
+{station}駅周辺で、上記の検索条件に近い類似物件の家賃相場を調査してください。
+
 [TABLE]
-間取り | 面積目安 | 月額賃料相場 | 参考物件名
-1K | 20-25㎡ | ○万円 | ○○マンション等
-1DK | 25-35㎡ | ○万円 | ○○アパート等
-2DK | 35-45㎡ | ○万円 | ○○ハイツ等
+物件名 | 所在地 | 間取り/面積 | 築年 | 駅徒歩 | 月額賃料
+○○マンション | {station}駅周辺 | 1K/25㎡ | 2010年 | 徒歩○分 | ○万円
 [/TABLE]
 
-具体的な物件名（マンション名・アパート名）を挙げて相場を説明してください。
+具体的な物件名（マンション名・アパート名）を挙げてください。
 可能な限り参照URL（SUUMO、HOME'S、at home等の不動産サイト）を記載してください。
 例: ○○マンション（1K/25㎡）: 月額5.5万円 (参照: https://suumo.jp/...)
 
@@ -604,7 +632,7 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
 プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
 上記の[HEADING][/HEADING]タグと[TABLE][/TABLE]タグはそのまま使ってください。
 
-最後に改めて確認: 上記はすべて{address}（{station}駅周辺）の情報です。東京都千代田区永田町などの情報は含めないでください。
+最後に改めて確認: 上記はすべて{address}（{station}駅周辺）の情報です。他の都道府県の情報は含めないでください。
 """
         response = gemini_client.generate_content(prompt)
         return {
@@ -1197,7 +1225,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         traceback.print_exc()
 
 
-def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict) -> str:
+def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict, gemini_client=None) -> str:
     """Google Docsで要件定義書サンプル準拠の構造化レポートを作成"""
     try:
         # ドキュメント作成
@@ -1259,6 +1287,21 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             sections.append(("{{TABLE_SIM_CONDITIONS}}", 'NORMAL_TEXT'))
             sections.append(("投資分析結果", 'HEADING_2'))
             sections.append(("{{TABLE_SIM_RESULTS}}", 'NORMAL_TEXT'))
+
+            # 収益指標の凡例
+            sections.append(("指標の解説", 'HEADING_2'))
+            legend_text = (
+                "表面利回り: 満室想定年間賃料 / 物件価格。購入諸費用を含まない簡易的な収益性指標。一般的に5%以上が目安。\n\n"
+                "FCR（総収益率）: 初年度NOI（営業純利益） / 総投資額（物件価格＋購入諸費用）。実質的な投資利回りを示す。\n\n"
+                "K%（ローン定数）: 年間返済額（ADS） / 借入額。借入コストの割合を示す。FCR > K% であればレバレッジが有効に機能している。\n\n"
+                "CCR（自己資本配当率）: 初年度税引前キャッシュフロー / 自己資金。自己資金に対する実質的なリターン。FCR < CCR < K% の関係が望ましい。\n\n"
+                "DCR（借入償還余裕率）: NOI / ADS。1.0以上で返済余力あり。1.3以上が安全水準の目安。\n\n"
+                "BER（損益分岐入居率）: （運営費＋年間返済額） / 満室想定年間賃料。この入居率を下回ると赤字。70%以下が安全圏の目安。\n\n"
+                "レバレッジ判定: FCR > K% なら Positive（借入により収益が増幅）。Negative の場合、借入が収益を圧迫している。\n\n"
+                "IRR（内部収益率）: 投資期間全体（保有＋売却）の年間平均リターン。期待収益率（5%）を上回ることが判断基準。\n\n"
+                "NPV（正味現在価値）: 将来キャッシュフローの現在価値合計 − 初期投資額。0以上であれば投資価値あり。"
+            )
+            sections.append((legend_text, 'NORMAL_TEXT'))
         else:
             sections.append(("シミュレーション実行不可（データ不足）", 'NORMAL_TEXT'))
 
@@ -1279,6 +1322,46 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
                 for w in sim_result['warnings']:
                     judgment_lines.append(f"  - {w}")
             sections.append(("\n".join(judgment_lines), 'NORMAL_TEXT'))
+
+            # Geminiによる投資アドバイス生成
+            try:
+                p = sim_result['params']
+                advice_prompt = f"""あなたは不動産投資の専門アドバイザーです。以下のシミュレーション結果に基づき、投資アドバイスを記述してください。
+
+物件情報:
+- 物件価格: {p['purchase_price']:,.0f}円
+- 満室想定賃料: 月額{p['full_occupancy_rent_monthly']:,.0f}円（年額{p['full_occupancy_rent_annual']:,.0f}円）
+- 構造: {detailed.get('structure', '不明')}
+- 築年月: {detailed.get('year_built', '不明')}
+- 最寄駅: {report_data['station']}
+
+シミュレーション結果:
+- 表面利回り: {m['gross_yield']:.2%}
+- FCR（総収益率）: {m['fcr']:.2%}
+- K%（ローン定数）: {m['k_percent']:.2%}
+- CCR（自己資本配当率）: {m['ccr']:.2%}
+- DCR（借入償還余裕率）: {m['dcr']:.2f}
+- BER（損益分岐入居率）: {m['ber']:.2%}
+- レバレッジ: {m['leverage']}
+- IRR: {m['irr']:.2%}
+- NPV: {m['npv']:,.0f}円
+- 総合判定: {d['recommendation']}（{d['pass_count']}/{d['total_count']}項目クリア）
+
+以下の内容を含めてください:
+1. この物件の投資としての総合評価（強み・弱み）
+2. 特に注意すべきリスク要因
+{"3. 投資推奨に転換するための条件（例: 物件価格が○○万円以下になれば全指標クリアとなる、賃料が月額○○万円以上なら収益性改善など、具体的な数値を提示）" if not d['all_pass'] else "3. 投資実行時の留意点"}
+4. 交渉時のアドバイス（指値の目安など）
+
+プレーンテキストで出力してください。マークダウン記法は使わないでください。
+見出しには番号を付けて区別してください。
+"""
+                advice_response = gemini_client.generate_content(advice_prompt)
+                sections.append(("", 'NORMAL_TEXT'))
+                sections.append(("投資アドバイス", 'HEADING_2'))
+                sections.append((_strip_markdown(advice_response.text), 'NORMAL_TEXT'))
+            except Exception as ae:
+                print(f"投資アドバイス生成エラー: {ae}")
         else:
             sections.append(("データ不足のため投資判断不可", 'NORMAL_TEXT'))
 
@@ -1653,10 +1736,16 @@ def generate_property_evaluation_report(
         walking_distance = calculate_walking_distance(location, station, gmaps_client)
 
         # 5. 相場調査（Gemini）
+        dd = detailed_data or {}
         property_info = {
             'property_number': property_number,
             'station': station,
-            'walking_distance': walking_distance
+            'walking_distance': walking_distance,
+            'structure': dd.get('structure'),
+            'year_built': dd.get('year_built'),
+            'floor_plan': dd.get('floor_plan'),
+            'building_area': dd.get('building_area'),
+            'total_units': dd.get('total_units'),
         }
         market_data = research_market_price(location, property_info, gemini_client)
         print(f"相場調査完了: {market_data['status']}")
@@ -1679,7 +1768,7 @@ def generate_property_evaluation_report(
             'detailed_data': detailed_data or {}
         }
 
-        doc_id = create_evaluation_report(docs_service, drive_service, folder_id, report_data)
+        doc_id = create_evaluation_report(docs_service, drive_service, folder_id, report_data, gemini_client=gemini_client)
 
         if doc_id:
             print(f"レポート生成完了: Doc ID={doc_id}")
