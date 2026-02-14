@@ -125,7 +125,7 @@ def calculate_sale_proceeds(noi_final_year, exit_cap_rate, loan_balance):
 
 
 def calculate_investment_metrics(cashflows, equity, sale, total_purchase_cost,
-                                  loan_amount, ads, expected_return):
+                                  loan_amount, ads, expected_return, purchase_price=None):
     """投資分析指標を計算"""
     year1 = cashflows[0]
 
@@ -171,8 +171,10 @@ def calculate_investment_metrics(cashflows, equity, sale, total_purchase_cost,
     except Exception:
         npv = None
 
-    # 表面利回り（参考値）
-    gross_yield = (cashflows[0]['gpi'] / total_purchase_cost) if total_purchase_cost > 0 else 0
+    # 表面利回り（参考値）= 満室想定年間賃料 / 物件価格
+    # 一般的な表面利回りは購入諸費用を含まない物件価格で計算する
+    price_for_yield = purchase_price if purchase_price and purchase_price > 0 else total_purchase_cost
+    gross_yield = (cashflows[0]['gpi'] / price_for_yield) if price_for_yield > 0 else 0
 
     return {
         'gross_yield': gross_yield,
@@ -296,7 +298,8 @@ def run_simulation(comprehensive_data):
         # 5. 投資指標計算
         metrics = calculate_investment_metrics(
             cashflows, equity, sale, total_purchase_cost,
-            loan_amount, ads, DEFAULT_EXPECTED_RETURN
+            loan_amount, ads, DEFAULT_EXPECTED_RETURN,
+            purchase_price=purchase_price
         )
 
         # 6. 投資判断

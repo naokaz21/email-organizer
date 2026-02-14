@@ -12,6 +12,8 @@ from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 from typing import Optional
 import io
+import unicodedata
+import urllib.parse
 from pypdf import PdfReader
 import google.generativeai as genai
 import googlemaps
@@ -189,6 +191,7 @@ def parse_gemini_property_response(response_text: str) -> dict:
         data = json.loads(text)
 
         # 数値型への変換（文字列として返される可能性があるため）
+        # 数値変換対象フィールド（building_coverage_ratio, floor_area_ratioはパーセンテージ文字列のまま保持）
         numeric_fields = ['price', 'land_area', 'building_area', 'total_units',
                          'full_occupancy_rent', 'management_fee', 'reserve_fund']
 
@@ -254,10 +257,11 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
 1. 基本情報:
    - property_number: 物件番号 (数字のみ)
    - station: 最寄駅 (「駅」を除く駅名のみ)
+   - railway_line: 最寄駅の路線名 (例: 小田急江ノ島線、JR東海道本線)
    - address: 住所 (完全な住所)
 
 2. 価格・構造:
-   - price: 販売価格 (円、数値のみ)
+   - price: 販売価格・物件価格 (円、数値のみ)
    - structure: 構造 (RC, SRC, 木造など)
    - year_built: 築年月 (YYYY年MM月 または YYYY/MM形式)
 
@@ -272,19 +276,36 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
    - management_fee: 管理費 (月額円、数値のみ)
    - reserve_fund: 修繕積立金 (月額円、数値のみ)
 
-5. レントロール (部屋別賃料一覧):
+5. 権利・法規制情報:
+   - rights_type: 権利形態 (所有権、借地権など)
+   - city_planning: 都市計画 (市街化区域、市街化調整区域など)
+   - zoning: 用途地域 (第一種住居地域、商業地域など)
+   - building_coverage_ratio: 建蔽率 (例: "60%")
+   - floor_area_ratio: 容積率 (例: "200%")
+   - road_access: 接道状況 (例: "南側6m公道")
+   - transaction_type: 取引態様 (媒介、仲介、売主など)
+
+6. レントロール (部屋別賃料一覧):
    - rent_roll: 配列形式 [{{"room": "部屋番号", "plan": "間取り", "area": 面積, "rent": 賃料}}, ...]
+
+【価格抽出に関する重要注意】
+- 「販売価格」「物件価格」「売出価格」と明記されている金額をpriceとして抽出すること
+- 「土地価格」「土地代」は物件全体価格ではないため、priceに入れないこと
+- 土地価格と物件全体価格を混同しないよう注意すること
+- 複数の価格が記載されている場合、物件全体の販売価格を優先すること
 
 【重要な指示】
 - 情報が見つからない場合は null を設定
 - 推測や補完は禁止、記載されている情報のみ抽出
 - 数値は数字のみ抽出（単位記号、カンマは除く）
+- 建蔽率・容積率はパーセンテージ付きの文字列で保持（例: "60%"）
 - 出力は必ず有効なJSON形式
 
 【出力形式】
 {{
   "property_number": "物件番号 or null",
   "station": "駅名 or null",
+  "railway_line": "路線名 or null",
   "address": "住所 or null",
   "price": 価格数値 or null,
   "structure": "構造 or null",
@@ -296,6 +317,13 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
   "floor_plan": "間取り or null",
   "management_fee": 管理費数値 or null,
   "reserve_fund": 積立金数値 or null,
+  "rights_type": "権利形態 or null",
+  "city_planning": "都市計画 or null",
+  "zoning": "用途地域 or null",
+  "building_coverage_ratio": "建蔽率 or null",
+  "floor_area_ratio": "容積率 or null",
+  "road_access": "接道状況 or null",
+  "transaction_type": "取引態様 or null",
   "rent_roll": [配列] or null
 }}
 """
@@ -317,10 +345,11 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
 1. 基本情報:
    - property_number: 物件番号 (数字のみ)
    - station: 最寄駅 (「駅」を除く駅名のみ)
+   - railway_line: 最寄駅の路線名 (例: 小田急江ノ島線、JR東海道本線)
    - address: 住所 (完全な住所)
 
 2. 価格・構造:
-   - price: 販売価格 (円、数値のみ)
+   - price: 販売価格・物件価格 (円、数値のみ)
    - structure: 構造 (RC, SRC, 木造など)
    - year_built: 築年月 (YYYY年MM月 または YYYY/MM形式)
 
@@ -335,19 +364,36 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
    - management_fee: 管理費 (月額円、数値のみ)
    - reserve_fund: 修繕積立金 (月額円、数値のみ)
 
-5. レントロール (部屋別賃料一覧):
+5. 権利・法規制情報:
+   - rights_type: 権利形態 (所有権、借地権など)
+   - city_planning: 都市計画 (市街化区域、市街化調整区域など)
+   - zoning: 用途地域 (第一種住居地域、商業地域など)
+   - building_coverage_ratio: 建蔽率 (例: "60%")
+   - floor_area_ratio: 容積率 (例: "200%")
+   - road_access: 接道状況 (例: "南側6m公道")
+   - transaction_type: 取引態様 (媒介、仲介、売主など)
+
+6. レントロール (部屋別賃料一覧):
    - rent_roll: 配列形式 [{"room": "部屋番号", "plan": "間取り", "area": 面積, "rent": 賃料}, ...]
+
+【価格抽出に関する重要注意】
+- 「販売価格」「物件価格」「売出価格」と明記されている金額をpriceとして抽出すること
+- 「土地価格」「土地代」は物件全体価格ではないため、priceに入れないこと
+- 土地価格と物件全体価格を混同しないよう注意すること
+- 複数の価格が記載されている場合、物件全体の販売価格を優先すること
 
 【重要な指示】
 - 情報が見つからない場合は null を設定
 - 推測や補完は禁止、記載されている情報のみ抽出
 - 数値は数字のみ抽出（単位記号、カンマは除く）
+- 建蔽率・容積率はパーセンテージ付きの文字列で保持（例: "60%"）
 - 出力は必ず有効なJSON形式
 
 【出力形式】
 {
   "property_number": "物件番号 or null",
   "station": "駅名 or null",
+  "railway_line": "路線名 or null",
   "address": "住所 or null",
   "price": 価格数値 or null,
   "structure": "構造 or null",
@@ -359,6 +405,13 @@ def extract_comprehensive_property_data(file_data: bytes, filename: str, gemini_
   "floor_plan": "間取り or null",
   "management_fee": 管理費数値 or null,
   "reserve_fund": 積立金数値 or null,
+  "rights_type": "権利形態 or null",
+  "city_planning": "都市計画 or null",
+  "zoning": "用途地域 or null",
+  "building_coverage_ratio": "建蔽率 or null",
+  "floor_area_ratio": "容積率 or null",
+  "road_access": "接道状況 or null",
+  "transaction_type": "取引態様 or null",
   "rent_roll": [配列] or null
 }
 """
@@ -432,17 +485,31 @@ def extract_address_with_gemini(text: str, gemini_client) -> Optional[str]:
         print(f"Gemini住所抽出エラー: {e}")
         return None
 
+def _clean_address(address: str) -> str:
+    """住所文字列をクリーニング（全角半角統一、余分な空白除去）"""
+    # NFKC正規化（全角英数→半角、半角カナ→全角など）
+    cleaned = unicodedata.normalize('NFKC', address)
+    # 余分な空白を除去
+    cleaned = re.sub(r'\s+', '', cleaned)
+    # 先頭・末尾の空白除去
+    cleaned = cleaned.strip()
+    return cleaned
+
+
 def geocode_address(address: str, gmaps_client) -> Optional[dict]:
     """住所から位置情報を取得"""
     try:
-        geocode_result = gmaps_client.geocode(address, language='ja')
+        cleaned = _clean_address(address)
+        print(f"Geocoding: クリーニング後住所='{cleaned}'")
+        geocode_result = gmaps_client.geocode(cleaned, language='ja', region='jp')
         if geocode_result:
             location = geocode_result[0]['geometry']['location']
             formatted_address = geocode_result[0]['formatted_address']
             return {
                 'lat': location['lat'],
                 'lng': location['lng'],
-                'formatted_address': formatted_address
+                'formatted_address': formatted_address,
+                'original_address': cleaned
             }
         return None
     except Exception as e:
@@ -452,23 +519,48 @@ def geocode_address(address: str, gmaps_client) -> Optional[dict]:
 def research_market_price(location: dict, property_info: dict, gemini_client) -> dict:
     """Gemini APIで周辺相場を調査"""
     try:
+        address = location.get('original_address') or location['formatted_address']
+        station = property_info.get('station', '不明')
         prompt = f"""
-あなたは不動産投資の専門家です。以下の物件について、周辺の類似物件の家賃相場を調査してください。
+あなたは不動産投資の専門家です。
+
+【重要】調査対象の物件住所: {address}
+【重要】調査対象の最寄駅: {station}駅
+【重要】上記の住所・駅の周辺の家賃相場を調査してください。他のエリアの情報は含めないでください。
 
 物件情報:
-- 住所: {location['formatted_address']}
+- 住所: {address}
 - 緯度経度: {location['lat']}, {location['lng']}
-- 駅: {property_info.get('station', '不明')}
+- 駅: {station}
 - 物件番号: {property_info.get('property_number')}
 
-以下の形式でレポートしてください:
-1. 周辺エリアの特徴
-2. 類似物件の家賃相場（ワンルーム、1K、1DK、2DKなど）
-3. 相場の根拠となる情報源
-4. 投資観点での評価コメント
+以下の形式でレポートしてください（構造化フォーマットで出力）:
+
+[HEADING]周辺エリアの特徴[/HEADING]
+{address}周辺（{station}駅エリア）の特徴を記述してください。
+
+[HEADING]類似物件の家賃相場[/HEADING]
+[TABLE]
+間取り | 面積目安 | 月額賃料相場 | 参考物件名
+1K | 20-25㎡ | ○万円 | ○○マンション等
+1DK | 25-35㎡ | ○万円 | ○○アパート等
+2DK | 35-45㎡ | ○万円 | ○○ハイツ等
+[/TABLE]
+
+具体的な物件名（マンション名・アパート名）を挙げて相場を説明してください。
+可能な限り参照URL（SUUMO、HOME'S、at home等の不動産サイト）を記載してください。
+例: ○○マンション（1K/25㎡）: 月額5.5万円 (参照: https://suumo.jp/...)
+
+[HEADING]相場の根拠となる情報源[/HEADING]
+参照元のURLや情報源を列挙してください。
+
+[HEADING]投資観点での評価コメント[/HEADING]
+{address}周辺の賃貸市場における投資評価コメントを記述してください。
 
 プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
-見出しには番号を付けて区別してください（例: 「1. 周辺エリアの特徴」）。
+上記の[HEADING][/HEADING]タグと[TABLE][/TABLE]タグはそのまま使ってください。
+
+最後に改めて確認: 上記はすべて{address}（{station}駅周辺）の情報です。東京都千代田区永田町などの情報は含めないでください。
 """
         response = gemini_client.generate_content(prompt)
         return {
@@ -485,64 +577,88 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
         }
 
 def research_area_with_gemini_search(location: dict, property_info: dict, gemini_client) -> dict:
-    """Gemini Web Search（Google Search grounding）でエリア調査"""
+    """Geminiでエリア調査（Web Search groundingなし＝知識ベースから回答）"""
     try:
+        address = location.get('original_address') or location['formatted_address']
+        station = property_info.get('station', '不明')
         prompt = f"""
-あなたは不動産投資エリア分析の専門家です。以下の物件エリアについてWeb検索で最新情報を調査してください。
+【重要】調査対象エリア: {address}
+【重要】調査対象の最寄駅: {station}駅
+【重要】{address}周辺の情報のみ回答してください。
+
+あなたは不動産投資エリア分析の専門家です。
+以下の物件エリア（{address}、{station}駅周辺）について調査してください。
 
 物件情報:
-- 住所: {location['formatted_address']}
+- 住所: {address}
 - 緯度経度: {location['lat']}, {location['lng']}
-- 駅: {property_info.get('station', '不明')}
+- 駅: {station}
 
-以下の5つの観点で調査してください:
+以下の5つの観点で調査し、構造化フォーマットで出力してください:
 
-1. 最寄駅情報
-  - 最寄駅（{property_info.get('station', '不明')}駅）の1日あたりの乗降客数（最新データ）
-  - 過去5年の乗降客数推移
-  - 利用可能な路線名
+[HEADING]最寄駅情報[/HEADING]
+[TABLE]
+項目 | 内容
+最寄駅 | {station}駅
+路線名 | （該当する路線名）
+1日あたり乗降客数 | ○○人（○年度）
+乗降客数推移（5年間） | ○○人→○○人（○%増減）
+[/TABLE]
+周辺駅との比較や補足コメントがあれば記述してください。
 
-2. 路線価
-  - 物件所在地（{location['formatted_address']}）付近の路線価（最新年度）
-  - 過去5年の路線価推移（上昇/下降トレンド）
+[HEADING]路線価[/HEADING]
+[TABLE]
+年度 | 路線価（円/㎡）
+2024 | ○○円
+2023 | ○○円
+2022 | ○○円
+2021 | ○○円
+2020 | ○○円
+[/TABLE]
+{address}付近の路線価トレンド分析コメント。
 
-3. 人口動態
-  - 過去10年の人口推移
-  - 単身世帯比率
-  - 年齢構成（特に賃貸需要層）
-  - 将来予測
+[HEADING]人口動態[/HEADING]
+[TABLE]
+項目 | 内容
+人口（最新） | ○○人
+過去10年推移 | ○○人→○○人
+単身世帯比率 | ○○%
+主要年齢層 | ○○代が○○%
+[/TABLE]
+賃貸需要に関するコメント。
 
-4. ハザードマップ
-  - 洪水リスク（浸水想定区域）
-  - 地震リスク（液状化、活断層）
-  - 土砂災害リスク
+[HEADING]ハザードマップ[/HEADING]
+[TABLE]
+リスク種別 | 評価 | 詳細
+洪水リスク | 低/中/高 | 浸水想定○m
+地震リスク | 低/中/高 | 液状化○○
+土砂災害リスク | 低/中/高 | ○○
+[/TABLE]
+リスク評価の補足コメント。
 
-5. 再開発計画
-  - 周辺の大規模開発プロジェクト
-  - 新駅・路線延伸計画
-  - 商業施設・インフラ整備
+[HEADING]再開発計画[/HEADING]
+{address}（{station}駅周辺）の再開発計画・大規模開発プロジェクト・新駅計画・商業施設整備等の情報。
 
-重要: 可能な限り出典URLを記載してください。最新情報を優先してください。
+重要: 可能な限り出典URLを記載してください。
 プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
-見出しには番号を付けて区別してください（例: 「1. 最寄駅情報」）。
+上記の[HEADING][/HEADING]タグと[TABLE][/TABLE]タグはそのまま使ってください。
+
+最後に改めて確認: 上記はすべて{address}（{station}駅周辺）の情報です。東京都千代田区永田町や他のエリアの情報は絶対に含めないでください。
 """
 
-        from google.generativeai.types import content_types
-        response = gemini_client.generate_content(
-            prompt,
-            tools='google_search_retrieval'
-        )
+        # google_search_retrievalを使わず通常のGemini呼び出し（永田町問題の回避）
+        response = gemini_client.generate_content(prompt)
 
         report_text = response.text
 
         return {
             'status': 'success',
             'report': report_text,
-            'model': 'gemini-2.5-flash-google-search'
+            'model': 'gemini-2.5-flash'
         }
 
     except Exception as e:
-        print(f"Gemini Web Searchエリア調査エラー: {e}")
+        print(f"Geminiエリア調査エラー: {e}")
         import traceback
         traceback.print_exc()
         return {
@@ -576,23 +692,76 @@ def combine_research_reports(gemini_market_report: dict, area_report: dict) -> s
 
     # Gemini市場調査
     if gemini_market_report.get('status') == 'success':
-        combined_parts.append("【市場調査】")
+        combined_parts.append("[HEADING]市場調査[/HEADING]")
         combined_parts.append(gemini_market_report.get('report', ''))
     else:
-        combined_parts.append("【市場調査】")
+        combined_parts.append("[HEADING]市場調査[/HEADING]")
         combined_parts.append("市場調査に失敗しました。")
 
     combined_parts.append("")
 
-    # エリア調査（Gemini Web Search）
+    # エリア調査
     if area_report.get('status') == 'success':
-        combined_parts.append("【エリア分析】")
+        combined_parts.append("[HEADING]エリア分析[/HEADING]")
         combined_parts.append(area_report.get('report', ''))
     else:
-        combined_parts.append("【エリア分析】")
+        combined_parts.append("[HEADING]エリア分析[/HEADING]")
         combined_parts.append("エリア分析をスキップしました。")
 
     return _strip_markdown("\n".join(combined_parts))
+
+
+def _parse_structured_research_text(text: str) -> list:
+    """構造化タグ付きテキストを解析して[(content, type)]のリストに変換
+
+    type: 'heading', 'table', 'text'
+    """
+    segments = []
+    remaining = text
+
+    while remaining:
+        # [HEADING]...[/HEADING] を検索
+        heading_match = re.search(r'\[HEADING\](.*?)\[/HEADING\]', remaining)
+        # [TABLE]...[/TABLE] を検索
+        table_match = re.search(r'\[TABLE\](.*?)\[/TABLE\]', remaining, re.DOTALL)
+
+        # 次に見つかるタグを判定
+        next_match = None
+        next_type = None
+
+        if heading_match and table_match:
+            if heading_match.start() < table_match.start():
+                next_match = heading_match
+                next_type = 'heading'
+            else:
+                next_match = table_match
+                next_type = 'table'
+        elif heading_match:
+            next_match = heading_match
+            next_type = 'heading'
+        elif table_match:
+            next_match = table_match
+            next_type = 'table'
+
+        if next_match is None:
+            # タグがもうない → 残りはすべてテキスト
+            stripped = remaining.strip()
+            if stripped:
+                segments.append((stripped, 'text'))
+            break
+
+        # タグの前のテキスト
+        before = remaining[:next_match.start()].strip()
+        if before:
+            segments.append((before, 'text'))
+
+        # タグ自体
+        segments.append((next_match.group(1).strip(), next_type))
+
+        # 残りを更新
+        remaining = remaining[next_match.end():]
+
+    return segments
 
 def _find_placeholder_range(docs_service, doc_id, placeholder):
     """プレースホルダー行全体のstart/endインデックスを返す"""
@@ -800,8 +969,58 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
             pass
 
 
+def _search_nearby_places(lat: float, lng: float, api_key: str) -> dict:
+    """Places API (New) で周辺施設を検索"""
+    import requests as req
+
+    facility_types = {
+        'convenience_store': {'color': 'green', 'label': 'C'},
+        'supermarket': {'color': 'blue', 'label': 'S'},
+        'restaurant': {'color': 'orange', 'label': 'R'},
+    }
+    results = {}
+
+    for place_type, marker_info in facility_types.items():
+        try:
+            resp = req.post(
+                'https://places.googleapis.com/v1/places:searchNearby',
+                headers={
+                    'X-Goog-Api-Key': api_key,
+                    'X-Goog-FieldMask': 'places.displayName,places.location,places.formattedAddress',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'includedTypes': [place_type],
+                    'maxResultCount': 3,
+                    'locationRestriction': {
+                        'circle': {
+                            'center': {'latitude': lat, 'longitude': lng},
+                            'radius': 500.0,
+                        }
+                    },
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                places = resp.json().get('places', [])
+                results[place_type] = {
+                    'places': places,
+                    'color': marker_info['color'],
+                    'label': marker_info['label'],
+                }
+                print(f"Places API: {place_type} → {len(places)}件")
+            else:
+                print(f"Places API エラー ({place_type}): HTTP {resp.status_code} - {resp.text[:200]}")
+                results[place_type] = {'places': [], 'color': marker_info['color'], 'label': marker_info['label']}
+        except Exception as e:
+            print(f"Places API 例外 ({place_type}): {e}")
+            results[place_type] = {'places': [], 'color': marker_info['color'], 'label': marker_info['label']}
+
+    return results
+
+
 def _insert_map_image(docs_service, drive_service, doc_id, location):
-    """地図画像をDrive経由でプレースホルダー位置に挿入"""
+    """地図画像をDrive経由でプレースホルダー位置に挿入（周辺施設マーカー付き）"""
     try:
         import requests as req
         from googleapiclient.http import MediaIoBaseUpload
@@ -820,11 +1039,26 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         lat, lng = location['lat'], location['lng']
         api_key = get_secret("GOOGLE_MAPS_API_KEY")
 
-        # Google Maps Static API で画像ダウンロード
+        # 周辺施設を検索
+        nearby = _search_nearby_places(lat, lng, api_key)
+
+        # 物件マーカー（赤、ラベル付き）
+        markers_param = f"&markers=color:red%7Clabel:P%7C{lat},{lng}"
+
+        # 周辺施設マーカーを追加
+        for place_type, info in nearby.items():
+            for place in info.get('places', []):
+                loc = place.get('location', {})
+                p_lat = loc.get('latitude')
+                p_lng = loc.get('longitude')
+                if p_lat and p_lng:
+                    markers_param += f"&markers=color:{info['color']}%7Clabel:{info['label']}%7C{p_lat},{p_lng}"
+
+        # Google Maps Static API で画像ダウンロード（zoom=15、施設マーカー付き）
         map_url = (
             f"https://maps.googleapis.com/maps/api/staticmap"
             f"?center={lat},{lng}&zoom=15&size=600x400&scale=2&maptype=roadmap"
-            f"&markers=color:red%7C{lat},{lng}"
+            f"{markers_param}"
             f"&key={api_key}"
         )
         resp = req.get(map_url, timeout=15)
@@ -848,8 +1082,9 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         ).execute()
         image_url = f"https://drive.google.com/uc?id={map_file_id}"
 
-        # Google Mapsリンク
-        maps_link = f"https://www.google.com/maps?q={lat},{lng}"
+        # Google Mapsリンク（住所テキストで検索）
+        addr_for_maps = location.get('original_address') or location.get('formatted_address', '')
+        maps_link = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr_for_maps)}"
 
         # 画像挿入
         docs_service.documents().batchUpdate(
@@ -866,16 +1101,31 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
             }]}
         ).execute()
 
-        # 画像の後にリンクテキストを追加
-        link_text = f"\nGoogle Mapsで開く\n"
+        # 画像の後に凡例 + リンクテキストを追加
+        legend_text = "\n🔴 物件所在地  🟢 コンビニ  🔵 スーパー  🟠 飲食店\n"
+        link_label = "Google Mapsで開く"
+        after_text = f"{legend_text}{link_label}\n"
         link_index = start + 1
 
         docs_service.documents().batchUpdate(
             documentId=doc_id,
             body={'requests': [
-                {'insertText': {'location': {'index': link_index}, 'text': link_text}},
+                {'insertText': {'location': {'index': link_index}, 'text': after_text}},
+                # 凡例テキストのスタイル
                 {'updateTextStyle': {
-                    'range': {'startIndex': link_index + 1, 'endIndex': link_index + 1 + len("Google Mapsで開く")},
+                    'range': {'startIndex': link_index, 'endIndex': link_index + len(legend_text)},
+                    'textStyle': {
+                        'fontSize': {'magnitude': 8, 'unit': 'PT'},
+                        'foregroundColor': _rgb({'red': 0.4, 'green': 0.4, 'blue': 0.4}),
+                    },
+                    'fields': 'fontSize,foregroundColor'
+                }},
+                # リンクテキストのスタイル
+                {'updateTextStyle': {
+                    'range': {
+                        'startIndex': link_index + len(legend_text),
+                        'endIndex': link_index + len(legend_text) + len(link_label),
+                    },
                     'textStyle': {
                         'link': {'url': maps_link},
                         'foregroundColor': _rgb(_ACCENT),
@@ -886,7 +1136,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
             ]}
         ).execute()
 
-        print(f"地図画像挿入完了")
+        print(f"地図画像挿入完了（周辺施設マーカー付き）")
 
     except Exception as e:
         print(f"地図画像挿入エラー（無視）: {e}")
@@ -931,10 +1181,23 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             sections.append(("レントロール", 'HEADING_2'))
             sections.append(("{{TABLE_RENT_ROLL}}", 'NORMAL_TEXT'))
 
-        # A2. 周辺環境調査
+        # A2. 周辺環境調査（構造化フォーマット対応）
         sections.append(("A2. 周辺環境調査", 'HEADING_1'))
         market_text = report_data.get('market_report', '調査データなし')
-        sections.append((market_text, 'NORMAL_TEXT'))
+        research_segments = _parse_structured_research_text(market_text)
+        for seg_content, seg_type in research_segments:
+            if seg_type == 'heading':
+                sections.append((seg_content, 'HEADING_2'))
+            elif seg_type == 'table':
+                # テーブルはプレースホルダーとして追加し後で処理
+                table_id = f"RESEARCH_TABLE_{len(sections)}"
+                sections.append((f"{{{{{table_id}}}}}", 'NORMAL_TEXT'))
+                # テーブルデータを保存（後で挿入）
+                if not hasattr(create_evaluation_report, '_research_tables'):
+                    create_evaluation_report._research_tables = {}
+                create_evaluation_report._research_tables[table_id] = seg_content
+            else:
+                sections.append((seg_content, 'NORMAL_TEXT'))
 
         # A3. 収益シミュレーション概要
         sections.append(("A3. 収益シミュレーション概要", 'HEADING_1'))
@@ -1171,7 +1434,11 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         # 住所: detailed_data（Gemini抽出）を優先、fallbackでgeocode結果
         address_display = detailed.get('address') or report_data.get('address', '不明')
         basic_rows.append(["所在地", address_display])
-        basic_rows.append(["最寄駅", report_data['station']])
+        # 最寄駅: 路線名 + 駅名の形式（例: 小田急江ノ島線 善行駅）
+        station_display = report_data['station']
+        if detailed.get('railway_line'):
+            station_display = f"{detailed['railway_line']} {station_display}"
+        basic_rows.append(["最寄駅", station_display])
         if detailed.get('price'):
             basic_rows.append(["物件価格", f"¥{detailed['price']:,.0f}"])
         if detailed.get('structure'):
@@ -1188,10 +1455,26 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             basic_rows.append(["満室時賃料", f"月額¥{detailed['full_occupancy_rent']:,.0f}（年額¥{detailed['full_occupancy_rent'] * 12:,.0f}）"])
         if detailed.get('floor_plan'):
             basic_rows.append(["間取り", detailed['floor_plan']])
+        # 新規追加フィールド
+        if detailed.get('rights_type'):
+            basic_rows.append(["権利形態", detailed['rights_type']])
+        if detailed.get('city_planning'):
+            basic_rows.append(["都市計画", detailed['city_planning']])
+        if detailed.get('zoning'):
+            basic_rows.append(["用途地域", detailed['zoning']])
+        if detailed.get('building_coverage_ratio'):
+            basic_rows.append(["建蔽率", str(detailed['building_coverage_ratio'])])
+        if detailed.get('floor_area_ratio'):
+            basic_rows.append(["容積率", str(detailed['floor_area_ratio'])])
+        if detailed.get('road_access'):
+            basic_rows.append(["接道状況", detailed['road_access']])
+        if detailed.get('transaction_type'):
+            basic_rows.append(["取引態様", detailed['transaction_type']])
         if sim_result:
             basic_rows.append(["表面利回り", f"{sim_result['metrics']['gross_yield']:.2%}"])
         if location and location.get('lat'):
-            maps_url = f"https://www.google.com/maps?q={location['lat']},{location['lng']}"
+            addr_for_maps = location.get('original_address') or address_display
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr_for_maps)}"
             basic_rows.append(["Google Maps", maps_url])
 
         _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_BASIC_INFO}}', basic_rows, 2)
@@ -1199,6 +1482,34 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         # 地図画像挿入
         if location and location.get('lat') and location.get('lng'):
             _insert_map_image(docs_service, drive_service, doc_id, location)
+
+        # 周辺調査テーブル挿入（_parse_structured_research_textで生成されたテーブル）
+        if hasattr(create_evaluation_report, '_research_tables'):
+            for table_id, table_content in create_evaluation_report._research_tables.items():
+                try:
+                    # パイプ区切りテーブルを解析
+                    lines = [l.strip() for l in table_content.strip().split('\n') if l.strip()]
+                    if lines:
+                        table_rows = []
+                        for line in lines:
+                            cols = [c.strip() for c in line.split('|') if c.strip()]
+                            if cols:
+                                table_rows.append(cols)
+                        if table_rows:
+                            col_count = max(len(r) for r in table_rows)
+                            # 列数を統一（足りない場合は空文字で埋める）
+                            for row in table_rows:
+                                while len(row) < col_count:
+                                    row.append('')
+                            _insert_table_at_placeholder(
+                                docs_service, doc_id,
+                                f'{{{{{table_id}}}}}',
+                                table_rows, col_count
+                            )
+                except Exception as te:
+                    print(f"周辺調査テーブル挿入エラー ({table_id}): {te}")
+            # クリーンアップ
+            create_evaluation_report._research_tables = {}
 
         # ドキュメントを物件フォルダに移動
         file = drive_service.files().get(fileId=doc_id, fields='parents').execute()
@@ -1259,8 +1570,13 @@ def generate_property_evaluation_report(
                 return None
             print(f"テキスト抽出完了: {len(text)} 文字")
 
-        # 3. 住所抽出（正規表現 → Geminiフォールバック）
-        address = extract_address_with_regex(text)
+        # 3. 住所抽出（detailed_data優先 → 正規表現 → Geminiフォールバック）
+        address = None
+        if detailed_data and detailed_data.get('address'):
+            address = detailed_data['address']
+            print(f"Gemini抽出住所を使用: {address}")
+        if not address:
+            address = extract_address_with_regex(text)
         if not address:
             print("正規表現で住所抽出失敗、Geminiを使用")
             address = extract_address_with_gemini(text, gemini_client)
