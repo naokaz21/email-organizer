@@ -502,21 +502,32 @@ def research_area_with_perplexity(location: dict, property_info: dict, perplexit
 - 緯度経度: {location['lat']}, {location['lng']}
 - 駅: {property_info.get('station', '不明')}
 
-以下の3つの観点で調査してください:
+以下の5つの観点で調査してください:
 
-1. 人口動態
+1. 最寄駅情報
+  - 最寄駅（{property_info.get('station', '不明')}駅）の1日あたりの乗降客数（最新データ）
+  - 過去5年の乗降客数推移
+  - 利用可能な路線名
+  - 出典URL
+
+2. 路線価
+  - 物件所在地（{location['formatted_address']}）付近の路線価（最新年度）
+  - 過去5年の路線価推移（上昇/下降トレンド）
+  - 出典URL（国税庁路線価図等）
+
+3. 人口動態
   - 過去10年の人口推移
   - 単身世帯比率
   - 年齢構成（特に賃貸需要層）
   - 将来予測
 
-2. ハザードマップ
+4. ハザードマップ
   - 洪水リスク（浸水想定区域）
   - 地震リスク（液状化、活断層）
   - 土砂災害リスク
   - 公式ハザードマップのURL
 
-3. 再開発計画
+5. 再開発計画
   - 周辺の大規模開発プロジェクト
   - 新駅・路線延伸計画
   - 商業施設・インフラ整備
@@ -803,6 +814,80 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
             pass
 
 
+def _insert_map_image(docs_service, doc_id, location):
+    """地図画像をプレースホルダー位置に挿入"""
+    try:
+        start, end = _find_placeholder_range(docs_service, doc_id, '{{MAP_IMAGE}}')
+        if start is None:
+            print("地図プレースホルダー未検出")
+            return
+
+        # プレースホルダー削除
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': [{'deleteContentRange': {'range': {'startIndex': start, 'endIndex': end}}}]}
+        ).execute()
+
+        lat, lng = location['lat'], location['lng']
+        api_key = get_secret("GOOGLE_MAPS_API_KEY")
+
+        # Google Maps Static API URL
+        map_url = (
+            f"https://maps.googleapis.com/maps/api/staticmap"
+            f"?center={lat},{lng}&zoom=15&size=600x400&scale=2&maptype=roadmap"
+            f"&markers=color:red%7C{lat},{lng}"
+            f"&key={api_key}"
+        )
+
+        # Google Mapsリンク
+        maps_link = f"https://www.google.com/maps?q={lat},{lng}"
+
+        # 画像挿入
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': [{
+                'insertInlineImage': {
+                    'uri': map_url,
+                    'location': {'index': start},
+                    'objectSize': {
+                        'width': {'magnitude': 450, 'unit': 'PT'},
+                        'height': {'magnitude': 300, 'unit': 'PT'},
+                    }
+                }
+            }]}
+        ).execute()
+
+        # 画像の後にリンクテキストを追加
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        # 画像挿入後のインデックスを取得（画像の直後）
+        link_text = f"\nGoogle Mapsで開く\n"
+        # 画像は1文字分のインデックスを占める
+        link_index = start + 1
+
+        docs_service.documents().batchUpdate(
+            documentId=doc_id,
+            body={'requests': [
+                {'insertText': {'location': {'index': link_index}, 'text': link_text}},
+                {'updateTextStyle': {
+                    'range': {'startIndex': link_index + 1, 'endIndex': link_index + 1 + len("Google Mapsで開く")},
+                    'textStyle': {
+                        'link': {'url': maps_link},
+                        'foregroundColor': _rgb(_ACCENT),
+                        'fontSize': {'magnitude': 9, 'unit': 'PT'},
+                    },
+                    'fields': 'link,foregroundColor,fontSize'
+                }}
+            ]}
+        ).execute()
+
+        print(f"地図画像挿入完了")
+
+    except Exception as e:
+        print(f"地図画像挿入エラー（無視）: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def create_evaluation_report(docs_service, drive_service, folder_id: str, report_data: dict) -> str:
     """Google Docsで要件定義書サンプル準拠の構造化レポートを作成"""
     try:
@@ -828,6 +913,12 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         sections.append(("A1. 物件概要", 'HEADING_1'))
         sections.append(("基本情報", 'HEADING_2'))
         sections.append(("{{TABLE_BASIC_INFO}}", 'NORMAL_TEXT'))
+
+        # 地図
+        location = report_data.get('location')
+        if location and location.get('lat') and location.get('lng'):
+            sections.append(("所在地マップ", 'HEADING_2'))
+            sections.append(("{{MAP_IMAGE}}", 'NORMAL_TEXT'))
 
         # レントロール
         if detailed.get('rent_roll') and len(detailed['rent_roll']) > 0:
@@ -1093,8 +1184,15 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             basic_rows.append(["間取り", detailed['floor_plan']])
         if sim_result:
             basic_rows.append(["表面利回り", f"{sim_result['metrics']['gross_yield']:.2%}"])
+        if location and location.get('lat'):
+            maps_url = f"https://www.google.com/maps?q={location['lat']},{location['lng']}"
+            basic_rows.append(["Google Maps", maps_url])
 
         _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_BASIC_INFO}}', basic_rows, 2)
+
+        # 地図画像挿入
+        if location and location.get('lat') and location.get('lng'):
+            _insert_map_image(docs_service, doc_id, location)
 
         # ドキュメントを物件フォルダに移動
         file = drive_service.files().get(fileId=doc_id, fields='parents').execute()
