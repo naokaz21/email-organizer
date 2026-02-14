@@ -467,7 +467,8 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
 3. 相場の根拠となる情報源
 4. 投資観点での評価コメント
 
-マークダウン形式で出力してください。
+プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
+見出しには番号を付けて区別してください（例: 「1. 周辺エリアの特徴」）。
 """
         response = gemini_client.generate_content(prompt)
         return {
@@ -501,27 +502,29 @@ def research_area_with_perplexity(location: dict, property_info: dict, perplexit
 - 緯度経度: {location['lat']}, {location['lng']}
 - 駅: {property_info.get('station', '不明')}
 
-以下の3つの観点で調査し、マークダウン形式でレポートしてください:
+以下の3つの観点で調査してください:
 
-## 1. 人口動態
-- 過去10年の人口推移
-- 単身世帯比率
-- 年齢構成（特に賃貸需要層）
-- 将来予測
+1. 人口動態
+  - 過去10年の人口推移
+  - 単身世帯比率
+  - 年齢構成（特に賃貸需要層）
+  - 将来予測
 
-## 2. ハザードマップ
-- 洪水リスク（浸水想定区域）
-- 地震リスク（液状化、活断層）
-- 土砂災害リスク
-- 公式ハザードマップのURL
+2. ハザードマップ
+  - 洪水リスク（浸水想定区域）
+  - 地震リスク（液状化、活断層）
+  - 土砂災害リスク
+  - 公式ハザードマップのURL
 
-## 3. 再開発計画
-- 周辺の大規模開発プロジェクト
-- 新駅・路線延伸計画
-- 商業施設・インフラ整備
-- 公式発表のURL
+3. 再開発計画
+  - 周辺の大規模開発プロジェクト
+  - 新駅・路線延伸計画
+  - 商業施設・インフラ整備
+  - 公式発表のURL
 
-**重要**: 必ず出典URLを記載してください。2024年以降の最新情報を優先してください。
+重要: 必ず出典URLを記載してください。2024年以降の最新情報を優先してください。
+プレーンテキストで出力してください。マークダウン記法（#、##、###、**、*、```等）は一切使わないでください。
+見出しには番号を付けて区別してください（例: 「1. 人口動態」）。
 """
 
         response = perplexity_client.chat.completions.create(
@@ -550,30 +553,49 @@ def research_area_with_perplexity(location: dict, property_info: dict, perplexit
             'report': 'エリア調査に失敗しました。'
         }
 
+def _strip_markdown(text: str) -> str:
+    """Markdown記法をプレーンテキストに変換"""
+    # 見出し記号を除去 (### heading → heading)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # 太字/斜体を除去 (**text** → text, *text* → text)
+    text = re.sub(r'\*{1,3}(.+?)\*{1,3}', r'\1', text)
+    # コードブロックを除去
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # インラインコードを除去
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # リンク [text](url) → text (url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', text)
+    # 水平線 --- を除去
+    text = re.sub(r'^-{3,}$', '', text, flags=re.MULTILINE)
+    # 連続空行を1行に
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def combine_research_reports(gemini_market_report: dict, perplexity_area_report: dict) -> str:
     """Gemini市場調査とPerplexityエリア調査を統合"""
     combined_parts = []
 
     # Gemini市場調査
     if gemini_market_report.get('status') == 'success':
-        combined_parts.append("## 市場調査（Gemini）")
+        combined_parts.append("【市場調査】")
         combined_parts.append(gemini_market_report.get('report', ''))
     else:
-        combined_parts.append("## 市場調査")
+        combined_parts.append("【市場調査】")
         combined_parts.append("市場調査に失敗しました。")
 
     combined_parts.append("")
 
     # Perplexityエリア調査
     if perplexity_area_report.get('status') == 'success':
-        combined_parts.append("## エリア分析（Perplexity）")
+        combined_parts.append("【エリア分析】")
         combined_parts.append(perplexity_area_report.get('report', ''))
     else:
         # Perplexity失敗時はスキップ（graceful degradation）
-        combined_parts.append("## エリア分析")
+        combined_parts.append("【エリア分析】")
         combined_parts.append("エリア分析をスキップしました。")
 
-    return "\n".join(combined_parts)
+    return _strip_markdown("\n".join(combined_parts))
 
 def _find_placeholder_range(docs_service, doc_id, placeholder):
     """プレースホルダー行全体のstart/endインデックスを返す"""
@@ -1049,7 +1071,9 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
 
         # 基本情報テーブル
         basic_rows = [["項目", "内容"]]
-        basic_rows.append(["所在地", report_data.get('address', '不明')])
+        # 住所: detailed_data（Gemini抽出）を優先、fallbackでgeocode結果
+        address_display = detailed.get('address') or report_data.get('address', '不明')
+        basic_rows.append(["所在地", address_display])
         basic_rows.append(["最寄駅", report_data['station']])
         if detailed.get('price'):
             basic_rows.append(["物件価格", f"¥{detailed['price']:,.0f}"])
