@@ -495,10 +495,9 @@ def create_simulation_excel(simulation_result, property_info, drive_service, fol
         total_row = len(cfs) + 2
         ws2.cell(row=total_row, column=1, value="合計").font = Font(bold=True)
         ws2.cell(row=total_row, column=1).border = thin_border
+        key_map = {2: 'gpi', 3: 'vacancy_loss', 4: 'egi', 5: 'opex', 6: 'noi', 7: 'ads', 8: 'btcfo'}
         for col in range(2, 9):
-            total = sum(cf[headers[col-1].lower() if col > 1 else 'year'] for cf in cfs) if col > 1 else None
             if col > 1:
-                key_map = {2: 'gpi', 3: 'vacancy_loss', 4: 'egi', 5: 'opex', 6: 'noi', 7: 'ads', 8: 'btcfo'}
                 total = sum(cf[key_map[col]] for cf in cfs)
                 cell = ws2.cell(row=total_row, column=col, value=total)
                 cell.number_format = yen_format
