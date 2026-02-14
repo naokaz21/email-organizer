@@ -516,11 +516,52 @@ def geocode_address(address: str, gmaps_client) -> Optional[dict]:
         print(f"Geocoding エラー: {e}")
         return None
 
+def calculate_walking_distance(location: dict, station: str, gmaps_client) -> Optional[dict]:
+    """Google Maps Distance Matrix APIで物件から最寄駅までの徒歩距離・時間を取得"""
+    try:
+        origin = f"{location['lat']},{location['lng']}"
+        destination = f"{station}駅"
+
+        result = gmaps_client.distance_matrix(
+            origins=[origin],
+            destinations=[destination],
+            mode='walking',
+            language='ja',
+            region='jp'
+        )
+
+        if result['status'] == 'OK':
+            element = result['rows'][0]['elements'][0]
+            if element['status'] == 'OK':
+                distance_info = {
+                    'distance_text': element['distance']['text'],
+                    'distance_meters': element['distance']['value'],
+                    'duration_text': element['duration']['text'],
+                    'duration_seconds': element['duration']['value'],
+                    'duration_minutes': round(element['duration']['value'] / 60),
+                }
+                print(f"徒歩距離計算完了: {station}駅まで {distance_info['distance_text']} / {distance_info['duration_text']}")
+                return distance_info
+            else:
+                print(f"Distance Matrix要素エラー: {element['status']}")
+                return None
+        else:
+            print(f"Distance Matrixエラー: {result['status']}")
+            return None
+    except Exception as e:
+        print(f"徒歩距離計算エラー: {e}")
+        return None
+
+
 def research_market_price(location: dict, property_info: dict, gemini_client) -> dict:
     """Gemini APIで周辺相場を調査"""
     try:
         address = location.get('original_address') or location['formatted_address']
         station = property_info.get('station', '不明')
+        walking_info = property_info.get('walking_distance')
+        walking_desc = ""
+        if walking_info:
+            walking_desc = f"\n- 最寄駅までの徒歩距離: {walking_info['distance_text']}（徒歩{walking_info['duration_minutes']}分）※Google Maps Distance Matrix APIによる実測値"
         prompt = f"""
 あなたは不動産投資の専門家です。
 
@@ -531,8 +572,11 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
 物件情報:
 - 住所: {address}
 - 緯度経度: {location['lat']}, {location['lng']}
-- 駅: {station}
+- 駅: {station}{walking_desc}
 - 物件番号: {property_info.get('property_number')}
+
+【駅距離に関する注意】
+駅までの距離・徒歩時間について言及する場合は、上記のGoogle Maps実測値（徒歩{walking_info['duration_minutes'] if walking_info else '不明'}分）のみを使用してください。独自に推測した距離を記載しないでください。
 
 以下の形式でレポートしてください（構造化フォーマットで出力）:
 
@@ -581,6 +625,12 @@ def research_area_with_gemini_search(location: dict, property_info: dict, gemini
     try:
         address = location.get('original_address') or location['formatted_address']
         station = property_info.get('station', '不明')
+        walking_info = property_info.get('walking_distance')
+        walking_desc = ""
+        walking_table_row = ""
+        if walking_info:
+            walking_desc = f"\n- 最寄駅までの徒歩距離: {walking_info['distance_text']}（徒歩{walking_info['duration_minutes']}分）※Google Maps実測値"
+            walking_table_row = f"\n物件からの徒歩距離 | {walking_info['distance_text']}（徒歩{walking_info['duration_minutes']}分）※Google Maps実測値"
         prompt = f"""
 【重要】調査対象エリア: {address}
 【重要】調査対象の最寄駅: {station}駅
@@ -592,7 +642,10 @@ def research_area_with_gemini_search(location: dict, property_info: dict, gemini
 物件情報:
 - 住所: {address}
 - 緯度経度: {location['lat']}, {location['lng']}
-- 駅: {station}
+- 駅: {station}{walking_desc}
+
+【駅距離に関する注意】
+駅までの距離・徒歩時間について言及する場合は、上記のGoogle Maps実測値のみを使用してください。独自に推測した距離を記載しないでください。
 
 以下の5つの観点で調査し、構造化フォーマットで出力してください:
 
@@ -600,7 +653,7 @@ def research_area_with_gemini_search(location: dict, property_info: dict, gemini
 [TABLE]
 項目 | 内容
 最寄駅 | {station}駅
-路線名 | （該当する路線名）
+路線名 | （該当する路線名）{walking_table_row}
 1日あたり乗降客数 | ○○人（○年度）
 乗降客数推移（5年間） | ○○人→○○人（○%増減）
 [/TABLE]
@@ -1434,10 +1487,13 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         # 住所: detailed_data（Gemini抽出）を優先、fallbackでgeocode結果
         address_display = detailed.get('address') or report_data.get('address', '不明')
         basic_rows.append(["所在地", address_display])
-        # 最寄駅: 路線名 + 駅名の形式（例: 小田急江ノ島線 善行駅）
+        # 最寄駅: 路線名 + 駅名 + 徒歩距離の形式（例: 小田急江ノ島線 善行駅 徒歩6分）
         station_display = report_data['station']
         if detailed.get('railway_line'):
             station_display = f"{detailed['railway_line']} {station_display}"
+        walking = report_data.get('walking_distance')
+        if walking:
+            station_display += f" 徒歩{walking['duration_minutes']}分（{walking['distance_text']}）"
         basic_rows.append(["最寄駅", station_display])
         if detailed.get('price'):
             basic_rows.append(["物件価格", f"¥{detailed['price']:,.0f}"])
@@ -1593,10 +1649,14 @@ def generate_property_evaluation_report(
             return None
         print(f"位置情報取得完了: {location}")
 
+        # 4.5. 徒歩距離計算（Google Maps Distance Matrix API）
+        walking_distance = calculate_walking_distance(location, station, gmaps_client)
+
         # 5. 相場調査（Gemini）
         property_info = {
             'property_number': property_number,
-            'station': station
+            'station': station,
+            'walking_distance': walking_distance
         }
         market_data = research_market_price(location, property_info, gemini_client)
         print(f"相場調査完了: {market_data['status']}")
@@ -1614,6 +1674,7 @@ def generate_property_evaluation_report(
             'station': station,
             'address': location['formatted_address'],
             'location': location,
+            'walking_distance': walking_distance,
             'market_report': combined_report,
             'detailed_data': detailed_data or {}
         }
