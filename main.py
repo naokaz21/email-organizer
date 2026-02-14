@@ -1348,7 +1348,9 @@ def test_folder(folder_id):
         if not files:
             return jsonify({"status": "error", "message": "PDF/画像ファイルが見つかりません"}), 404
 
-        target = files[0]
+        # 買付書(Kaitsuke_)を除外し、販売図面を優先
+        non_kaitsuke = [f for f in files if not f['name'].lower().startswith('kaitsuke')]
+        target = non_kaitsuke[0] if non_kaitsuke else files[0]
         print(f"対象ファイル: {target['name']}")
 
         # ファイルダウンロード
