@@ -1322,6 +1322,155 @@ def process():
             "message": str(e)
         }), 500
 
+@app.route('/test/<folder_id>', methods=['POST'])
+def test_folder(folder_id):
+    """既存フォルダのPDFからシミュレーション+レポート生成をテスト（メール受信スキップ）"""
+    try:
+        drive = get_drive_service()
+
+        # フォルダ情報取得
+        folder_info = drive.files().get(fileId=folder_id, fields='name').execute()
+        folder_name = folder_info['name']
+        parts = folder_name.split('_')
+        if len(parts) >= 3:
+            property_number, station = parts[2], parts[1]
+        elif len(parts) == 2:
+            property_number, station = parts[1], parts[0]
+        else:
+            property_number, station = folder_name, '不明'
+
+        print(f"テスト開始: {folder_name} (物件:{property_number}, 駅:{station})")
+
+        # フォルダ内のPDF/画像を検索
+        query = f"'{folder_id}' in parents and trashed=false and (mimeType='application/pdf' or mimeType contains 'image/')"
+        files = drive.files().list(q=query, fields='files(id, name, mimeType)', pageSize=10).execute().get('files', [])
+
+        if not files:
+            return jsonify({"status": "error", "message": "PDF/画像ファイルが見つかりません"}), 404
+
+        target = files[0]
+        print(f"対象ファイル: {target['name']}")
+
+        # ファイルダウンロード
+        from googleapiclient.http import MediaIoBaseDownload
+        request = drive.files().get_media(fileId=target['id'])
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        file_data = fh.getvalue()
+        print(f"ダウンロード完了: {len(file_data):,} bytes")
+
+        # テキスト抽出
+        gemini_client = get_gemini_client()
+        is_pdf = target['name'].lower().endswith('.pdf')
+        if is_pdf:
+            extracted_text = extract_text_from_pdf(file_data)
+        else:
+            extracted_text = extract_text_from_image(file_data, gemini_client)
+        print(f"テキスト抽出: {len(extracted_text)} 文字")
+
+        # 販売図面判定
+        is_sales = is_hanbaizumen(extracted_text)
+        print(f"販売図面判定: {is_sales}")
+
+        # 包括的データ抽出
+        comprehensive_data = extract_comprehensive_property_data(file_data, target['name'], gemini_client)
+        print(f"データ抽出完了: {len(comprehensive_data)} フィールド")
+
+        # シミュレーション
+        simulation_result = None
+        excel_file_id = None
+        try:
+            simulation_result = run_simulation(comprehensive_data)
+            if simulation_result:
+                print(f"シミュレーション完了: {simulation_result['decision']['recommendation']}")
+                excel_file_id = create_simulation_excel(
+                    simulation_result,
+                    {"property_number": property_number, "station": station},
+                    drive, folder_id
+                )
+                if excel_file_id:
+                    print(f"Excel保存完了: {excel_file_id}")
+                comprehensive_data['simulation_result'] = simulation_result
+            else:
+                print("シミュレーションスキップ（データ不足）")
+        except Exception as sim_e:
+            print(f"シミュレーションエラー: {sim_e}")
+            import traceback
+            traceback.print_exc()
+
+        # レポート生成
+        docs_service = get_docs_service()
+        gmaps_client = get_gmaps_client()
+        report_doc_id = generate_property_evaluation_report(
+            drive_service=drive,
+            docs_service=docs_service,
+            gmaps_client=gmaps_client,
+            gemini_client=gemini_client,
+            folder_id=folder_id,
+            pdf_file_id=target['id'],
+            property_number=property_number,
+            station=station,
+            extracted_text=extracted_text,
+            detailed_data=comprehensive_data,
+        )
+
+        result = {
+            "status": "success",
+            "folder": folder_name,
+            "property_number": property_number,
+            "station": station,
+            "target_file": target['name'],
+            "is_hanbaizumen": is_sales,
+            "data_fields": len(comprehensive_data),
+            "simulation": simulation_result['decision']['recommendation'] if simulation_result else "スキップ",
+            "excel_file_id": excel_file_id,
+            "report_doc_id": report_doc_id,
+        }
+        print(f"テスト完了: {result}")
+        return jsonify(result)
+
+    except Exception as e:
+        import traceback
+        print(f"テストエラー: {e}")
+        print(traceback.format_exc())
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/test/list', methods=['GET'])
+def test_list_folders():
+    """投資フォルダ内の物件フォルダ一覧を取得"""
+    try:
+        drive = get_drive_service()
+        investment_folder_id = get_secret("INVESTMENT_FOLDER_ID")
+
+        query = f"'{investment_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        results = drive.files().list(
+            q=query, fields='files(id, name)', orderBy='name desc', pageSize=20
+        ).execute()
+        folders = results.get('files', [])
+
+        folder_list = []
+        for folder in folders:
+            fquery = f"'{folder['id']}' in parents and trashed=false"
+            files = drive.files().list(q=fquery, fields='files(mimeType)', pageSize=50).execute().get('files', [])
+            file_types = {}
+            for f in files:
+                mt = f['mimeType'].split('/')[-1]
+                file_types[mt] = file_types.get(mt, 0) + 1
+            folder_list.append({
+                "id": folder['id'],
+                "name": folder['name'],
+                "files": file_types,
+            })
+
+        return jsonify({"status": "success", "folders": folder_list})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
