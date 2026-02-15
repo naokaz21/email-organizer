@@ -846,7 +846,7 @@ def _parse_structured_research_text(text: str) -> list:
 
 def _find_placeholder_range(docs_service, doc_id, placeholder):
     """プレースホルダー行全体のstart/endインデックスを返す"""
-    doc = docs_service.documents().get(documentId=doc_id).execute()
+    doc = _docs_api_call(lambda: docs_service.documents().get(documentId=doc_id).execute())
     for element in doc['body']['content']:
         if 'paragraph' in element:
             full_text = ''
@@ -871,6 +871,24 @@ def _rgb(color_dict):
     return {'color': {'rgbColor': color_dict}}
 
 
+def _docs_api_call(api_callable, max_retries=5):
+    """Google Docs API呼び出しをリトライ付きで実行（429レート制限対応）"""
+    import time
+    for attempt in range(max_retries):
+        try:
+            return api_callable()
+        except Exception as e:
+            error_str = str(e)
+            if '429' in error_str or 'Quota exceeded' in error_str or 'RATE_LIMIT_EXCEEDED' in error_str:
+                wait_time = min(2 ** attempt * 3, 30)  # 3, 6, 12, 24, 30秒
+                print(f"Docs API レート制限 (429)。{wait_time}秒待機後リトライ ({attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                raise
+    # 最終リトライ
+    return api_callable()
+
+
 def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, col_count):
     """プレースホルダーをスタイル付きテーブルに置換"""
     start, end = _find_placeholder_range(docs_service, doc_id, placeholder)
@@ -879,23 +897,23 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
         return
 
     # プレースホルダー行を削除
-    docs_service.documents().batchUpdate(
+    _docs_api_call(lambda: docs_service.documents().batchUpdate(
         documentId=doc_id,
         body={'requests': [{'deleteContentRange': {'range': {'startIndex': start, 'endIndex': end}}}]}
-    ).execute()
+    ).execute())
 
     # テーブル挿入
     row_count = len(rows_data)
-    docs_service.documents().batchUpdate(
+    _docs_api_call(lambda: docs_service.documents().batchUpdate(
         documentId=doc_id,
         body={'requests': [{'insertTable': {
             'rows': row_count, 'columns': col_count,
             'location': {'index': start}
         }}]}
-    ).execute()
+    ).execute())
 
     # ドキュメント再取得してテーブル構造を取得
-    doc = docs_service.documents().get(documentId=doc_id).execute()
+    doc = _docs_api_call(lambda: docs_service.documents().get(documentId=doc_id).execute())
     table_element = None
     table_start_index = None
     for element in doc['body']['content']:
@@ -922,9 +940,9 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
                 cell_requests.append({'insertText': {'location': {'index': cell_index}, 'text': text}})
 
     if cell_requests:
-        docs_service.documents().batchUpdate(
+        _docs_api_call(lambda: docs_service.documents().batchUpdate(
             documentId=doc_id, body={'requests': cell_requests}
-        ).execute()
+        ).execute())
 
     # === テーブルスタイリング ===
     style_requests = []
@@ -986,12 +1004,12 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
 
     if style_requests:
         try:
-            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+            _docs_api_call(lambda: docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute())
         except Exception as e:
             print(f"テーブルスタイル適用エラー（無視）: {e}")
 
     # ドキュメント再取得（テキスト挿入でインデックスが変わったため）
-    doc = docs_service.documents().get(documentId=doc_id).execute()
+    doc = _docs_api_call(lambda: docs_service.documents().get(documentId=doc_id).execute())
     table_element = None
     for element in doc['body']['content']:
         if 'table' in element and element['startIndex'] >= start:
@@ -1045,7 +1063,7 @@ def _insert_table_at_placeholder(docs_service, doc_id, placeholder, rows_data, c
 
     if text_requests:
         try:
-            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_requests}).execute()
+            _docs_api_call(lambda: docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_requests}).execute())
         except Exception:
             pass
 
@@ -1112,10 +1130,10 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
             return
 
         # プレースホルダー削除
-        docs_service.documents().batchUpdate(
+        _docs_api_call(lambda: docs_service.documents().batchUpdate(
             documentId=doc_id,
             body={'requests': [{'deleteContentRange': {'range': {'startIndex': start, 'endIndex': end}}}]}
-        ).execute()
+        ).execute())
 
         lat, lng = location['lat'], location['lng']
         api_key = get_secret("GOOGLE_MAPS_API_KEY")
@@ -1168,7 +1186,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         maps_link = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr_for_maps)}"
 
         # 画像挿入
-        docs_service.documents().batchUpdate(
+        _docs_api_call(lambda: docs_service.documents().batchUpdate(
             documentId=doc_id,
             body={'requests': [{
                 'insertInlineImage': {
@@ -1180,7 +1198,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
                     }
                 }
             }]}
-        ).execute()
+        ).execute())
 
         # 画像の後に凡例 + リンクテキストを追加
         legend_text = "\n🔴 物件所在地  🟢 コンビニ  🔵 スーパー  🟠 飲食店\n"
@@ -1188,7 +1206,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         after_text = f"{legend_text}{link_label}\n"
         link_index = start + 1
 
-        docs_service.documents().batchUpdate(
+        _docs_api_call(lambda: docs_service.documents().batchUpdate(
             documentId=doc_id,
             body={'requests': [
                 {'insertText': {'location': {'index': link_index}, 'text': after_text}},
@@ -1215,7 +1233,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
                     'fields': 'link,foregroundColor,fontSize'
                 }}
             ]}
-        ).execute()
+        ).execute())
 
         print(f"地図画像挿入完了（周辺施設マーカー付き）")
 
@@ -1230,7 +1248,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
     try:
         # ドキュメント作成
         title = f"物件評価レポート_{report_data['property_number']}_{report_data['station']}"
-        doc = docs_service.documents().create(body={'title': title}).execute()
+        doc = _docs_api_call(lambda: docs_service.documents().create(body={'title': title}).execute())
         doc_id = doc['documentId']
 
         detailed = report_data.get('detailed_data', {})
@@ -1287,6 +1305,10 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             sections.append(("{{TABLE_SIM_CONDITIONS}}", 'NORMAL_TEXT'))
             sections.append(("投資分析結果", 'HEADING_2'))
             sections.append(("{{TABLE_SIM_RESULTS}}", 'NORMAL_TEXT'))
+            sections.append(("年間キャッシュフロー（当初2年間）", 'HEADING_2'))
+            sections.append(("{{TABLE_ANNUAL_CF}}", 'NORMAL_TEXT'))
+            sections.append(("売却時キャッシュフロー", 'HEADING_2'))
+            sections.append(("{{TABLE_SALE_CF}}", 'NORMAL_TEXT'))
 
             # 収益指標の凡例
             sections.append(("指標の解説", 'HEADING_2'))
@@ -1326,25 +1348,28 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             # Geminiによる投資アドバイス生成
             try:
                 p = sim_result['params']
+                def _fmt_yen(v): return f"{float(v):,.0f}" if v is not None else "N/A"
+                def _fmt_pct(v): return f"{float(v):.2%}" if v is not None else "N/A"
+                def _fmt_f(v): return f"{float(v):.2f}" if v is not None else "N/A"
                 advice_prompt = f"""あなたは不動産投資の専門アドバイザーです。以下のシミュレーション結果に基づき、投資アドバイスを記述してください。
 
 物件情報:
-- 物件価格: {p['purchase_price']:,.0f}円
-- 満室想定賃料: 月額{p['full_occupancy_rent_monthly']:,.0f}円（年額{p['full_occupancy_rent_annual']:,.0f}円）
+- 物件価格: {_fmt_yen(p.get('purchase_price'))}円
+- 満室想定賃料: 月額{_fmt_yen(p.get('full_occupancy_rent_monthly'))}円（年額{_fmt_yen(p.get('full_occupancy_rent_annual'))}円）
 - 構造: {detailed.get('structure', '不明')}
 - 築年月: {detailed.get('year_built', '不明')}
 - 最寄駅: {report_data['station']}
 
 シミュレーション結果:
-- 表面利回り: {m['gross_yield']:.2%}
-- FCR（総収益率）: {m['fcr']:.2%}
-- K%（ローン定数）: {m['k_percent']:.2%}
-- CCR（自己資本配当率）: {m['ccr']:.2%}
-- DCR（借入償還余裕率）: {m['dcr']:.2f}
-- BER（損益分岐入居率）: {m['ber']:.2%}
-- レバレッジ: {m['leverage']}
-- IRR: {m['irr']:.2%}
-- NPV: {m['npv']:,.0f}円
+- 表面利回り: {_fmt_pct(m.get('gross_yield'))}
+- FCR（総収益率）: {_fmt_pct(m.get('fcr'))}
+- K%（ローン定数）: {_fmt_pct(m.get('k_percent'))}
+- CCR（自己資本配当率）: {_fmt_pct(m.get('ccr'))}
+- DCR（借入償還余裕率）: {_fmt_f(m.get('dcr'))}
+- BER（損益分岐入居率）: {_fmt_pct(m.get('ber'))}
+- レバレッジ: {m.get('leverage', 'N/A')}
+- IRR: {_fmt_pct(m.get('irr'))}
+- NPV: {_fmt_yen(m.get('npv'))}円
 - 総合判定: {d['recommendation']}（{d['pass_count']}/{d['total_count']}項目クリア）
 
 以下の内容を含めてください:
@@ -1373,7 +1398,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
         # === Step 2: テキスト一括挿入 + スタイル適用 ===
         full_text = "\n".join(s[0] for s in sections)
         requests = [{'insertText': {'location': {'index': 1}, 'text': full_text}}]
-        docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+        _docs_api_call(lambda: docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute())
 
         # スタイル適用（段落スタイル + テキストスタイル）
         style_requests = []
@@ -1392,7 +1417,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
             idx = end_idx + 1
 
         if style_requests:
-            docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+            _docs_api_call(lambda: docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute())
 
         # カスタムカラー・フォント適用
         idx = 1
@@ -1501,7 +1526,7 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
 
         if text_style_requests:
             try:
-                docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_style_requests}).execute()
+                _docs_api_call(lambda: docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': text_style_requests}).execute())
             except Exception as e:
                 print(f"テキストスタイル適用エラー（無視）: {e}")
 
@@ -1552,6 +1577,39 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
                 ["保有期間", f"{p.get('holding_period', 10)}年"],
             ]
             _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_SIM_CONDITIONS}}', sim_cond_data, 2)
+
+            # 売却時CFテーブル
+            sale_data = sim_result.get('sale', {})
+            if sale_data:
+                sale_cf_data = [
+                    ["項目", "金額"],
+                    ["出口Cap Rate", f"{p.get('exit_cap_rate', 0):.2%}"],
+                    ["最終年NOI", f"¥{sim_result['cashflows'][-1]['noi']:,.0f}"],
+                    ["売却想定価格", f"¥{sale_data['sale_price']:,.0f}"],
+                    ["売却諸費用（4%）", f"¥{sale_data['sale_expenses']:,.0f}"],
+                    ["ローン残債", f"¥{sale_data['loan_balance']:,.0f}"],
+                    ["売却手取り（税引前）", f"¥{sale_data['net_proceeds']:,.0f}"],
+                ]
+                _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_SALE_CF}}', sale_cf_data, 2)
+
+            # 年間CFテーブル（当初2年分）
+            annual_cfs = sim_result.get('cashflows', [])
+            if annual_cfs:
+                cf_table = [["項目", "1年目", "2年目"]]
+                cf1 = annual_cfs[0]
+                cf2 = annual_cfs[1] if len(annual_cfs) > 1 else annual_cfs[0]
+                cf_rows = [
+                    ("GPI（満室想定収入）", cf1['gpi'], cf2['gpi']),
+                    ("空室損", cf1['vacancy_loss'], cf2['vacancy_loss']),
+                    ("EGI（実効総収入）", cf1['egi'], cf2['egi']),
+                    ("OPEX（運営費）", cf1['opex'], cf2['opex']),
+                    ("NOI（営業純利益）", cf1['noi'], cf2['noi']),
+                    ("ADS（年間返済額）", cf1['ads'], cf2['ads']),
+                    ("BTCFo（税引前CF）", cf1['btcfo'], cf2['btcfo']),
+                ]
+                for label, v1, v2 in cf_rows:
+                    cf_table.append([label, f"¥{v1:,.0f}", f"¥{v2:,.0f}"])
+                _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_ANNUAL_CF}}', cf_table, 3)
 
         # レントロールテーブル
         if detailed.get('rent_roll') and len(detailed['rent_roll']) > 0:
