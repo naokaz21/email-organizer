@@ -520,7 +520,16 @@ def calculate_walking_distance(location: dict, station: str, gmaps_client) -> Op
     """Google Maps Distance Matrix APIで物件から最寄駅までの徒歩距離・時間を取得"""
     try:
         origin = f"{location['lat']},{location['lng']}"
-        destination = f"{station}駅"
+
+        # 同名駅の曖昧さ回避: 物件住所から市区情報を抽出して駅名に付加
+        address = location.get('original_address') or location.get('formatted_address', '')
+        # 住所から市区部分を抽出（例: 横浜市港北区 → 港北区）
+        import re
+        area_match = re.search(r'((?:東京都|北海道|(?:大阪|京都)府|.{2,3}県)?(?:\S+?市)?(?:\S+?区)?)', address)
+        area_hint = area_match.group(1) if area_match else ''
+
+        # まず「駅名 + 地域ヒント」で検索（同名駅の曖昧さ回避）
+        destination = f"{station}駅 {area_hint}" if area_hint else f"{station}駅"
 
         result = gmaps_client.distance_matrix(
             origins=[origin],
@@ -533,6 +542,73 @@ def calculate_walking_distance(location: dict, station: str, gmaps_client) -> Op
         if result['status'] == 'OK':
             element = result['rows'][0]['elements'][0]
             if element['status'] == 'OK':
+                distance_meters = element['distance']['value']
+
+                # 異常な距離（5km超）の場合、地域ヒントなしでリトライ
+                if distance_meters > 5000 and area_hint:
+                    print(f"距離異常検出 ({element['distance']['text']})。緯度経度ベースで再検索...")
+                    # 物件座標付近の最寄り駅をPlaces APIで検索
+                    try:
+                        import requests as req
+                        api_key = get_secret("GOOGLE_MAPS_API_KEY")
+                        places_resp = req.post(
+                            'https://places.googleapis.com/v1/places:searchNearby',
+                            headers={
+                                'X-Goog-Api-Key': api_key,
+                                'X-Goog-FieldMask': 'places.displayName,places.location',
+                                'Content-Type': 'application/json',
+                            },
+                            json={
+                                'includedTypes': ['train_station', 'subway_station'],
+                                'maxResultCount': 5,
+                                'locationRestriction': {
+                                    'circle': {
+                                        'center': {'latitude': location['lat'], 'longitude': location['lng']},
+                                        'radius': 3000.0
+                                    }
+                                }
+                            },
+                            timeout=10
+                        )
+                        if places_resp.status_code == 200:
+                            places_data = places_resp.json()
+                            nearby_stations = places_data.get('places', [])
+                            # 駅名に部分一致する駅を探す
+                            matched_station = None
+                            for ns in nearby_stations:
+                                name = ns.get('displayName', {}).get('text', '')
+                                if station in name:
+                                    matched_station = ns
+                                    break
+                            # 一致する駅がなければ最寄りの駅を使用
+                            if not matched_station and nearby_stations:
+                                matched_station = nearby_stations[0]
+                                new_station_name = matched_station.get('displayName', {}).get('text', station)
+                                print(f"最寄駅を変更: {station}駅 → {new_station_name}")
+
+                            if matched_station:
+                                ns_loc = matched_station.get('location', {})
+                                ns_lat = ns_loc.get('latitude')
+                                ns_lng = ns_loc.get('longitude')
+                                if ns_lat and ns_lng:
+                                    # 正しい駅座標で再計算
+                                    result2 = gmaps_client.distance_matrix(
+                                        origins=[origin],
+                                        destinations=[f"{ns_lat},{ns_lng}"],
+                                        mode='walking',
+                                        language='ja',
+                                        region='jp'
+                                    )
+                                    if result2['status'] == 'OK':
+                                        el2 = result2['rows'][0]['elements'][0]
+                                        if el2['status'] == 'OK':
+                                            element = el2
+                                            distance_meters = el2['distance']['value']
+                                            ns_name = matched_station.get('displayName', {}).get('text', station)
+                                            print(f"再検索成功: {ns_name}まで {el2['distance']['text']}")
+                    except Exception as pe:
+                        print(f"Places API再検索エラー（元の結果を使用）: {pe}")
+
                 distance_info = {
                     'distance_text': element['distance']['text'],
                     'distance_meters': element['distance']['value'],
