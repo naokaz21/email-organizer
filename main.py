@@ -2048,6 +2048,7 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
 
     for msg in messages:
         try:
+            report_failed = False  # レポート生成失敗フラグ
             message = gmail.users().messages().get(userId='me', id=msg['id']).execute()
 
             # 本文取得（再帰的にpartsを探索）
@@ -2211,18 +2212,23 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
                                 if report_doc_id:
                                     print(f"評価レポート生成成功: {report_doc_id}")
                                 else:
-                                    print(f"評価レポート生成失敗（処理は継続）")
+                                    report_failed = True
+                                    print(f"評価レポート生成失敗（ラベル付与をスキップ、次回再処理）")
                             except Exception as e:
-                                print(f"レポート生成エラー（処理継続）: {e}")
+                                report_failed = True
+                                print(f"レポート生成エラー（ラベル付与をスキップ、次回再処理）: {e}")
                                 import traceback
                                 traceback.print_exc()
 
-            # 処理済みラベル追加
-            gmail.users().messages().modify(
-                userId='me',
-                id=msg['id'],
-                body={'addLabelIds': [processed_label_id]}
-            ).execute()
+            # 処理済みラベル追加（レポート生成失敗時はスキップ→次回再処理）
+            if report_failed:
+                print(f"レポート未生成のためラベル付与スキップ: {folder_name}")
+            else:
+                gmail.users().messages().modify(
+                    userId='me',
+                    id=msg['id'],
+                    body={'addLabelIds': [processed_label_id]}
+                ).execute()
 
             results.append(f"Processed: {folder_name}")
 
