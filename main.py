@@ -1561,8 +1561,12 @@ def create_evaluation_report(docs_service, drive_service, folder_id: str, report
                 plan = unit.get('plan', unit.get('floor_plan', ''))
                 area = unit.get('area', '')
                 plan_area = f"{plan}" + (f"（{area}畳）" if area else "")
-                rent = unit.get('rent', 0)
-                rent_data.append([str(room), plan_area, f"¥{rent:,.0f}"])
+                rent = unit.get('rent') or 0
+                try:
+                    rent_val = float(rent) if rent else 0
+                    rent_data.append([str(room), plan_area, f"¥{rent_val:,.0f}"])
+                except (ValueError, TypeError):
+                    rent_data.append([str(room), plan_area, str(rent)])
             _insert_table_at_placeholder(docs_service, doc_id, '{{TABLE_RENT_ROLL}}', rent_data, 3)
 
         # 基本情報テーブル
@@ -2017,8 +2021,11 @@ def process_email_type(gmail, drive, query, label_name, processed_label_id, inve
             if not body and 'body' in message['payload'] and 'data' in message['payload']['body']:
                 body = base64.urlsafe_b64decode(message['payload']['body']['data']).decode('utf-8', errors='ignore')
 
-            # 物件情報抽出
-            info = extract_info_fn(body, attachments) if len(extract_info_fn.__code__.co_varnames) > 1 else extract_info_fn(body)
+            # 物件情報抽出（関数のパラメータ数で呼び分け）
+            import inspect
+            sig = inspect.signature(extract_info_fn)
+            param_count = len(sig.parameters)
+            info = extract_info_fn(body, attachments) if param_count > 1 else extract_info_fn(body)
 
             # 新形式（dict）と旧形式（tuple）の両方に対応
             if isinstance(info, dict):
