@@ -711,11 +711,46 @@ def research_market_price(location: dict, property_info: dict, gemini_client) ->
 最後に改めて確認: 上記はすべて{address}（{station}駅周辺）の情報です。他の都道府県の情報は含めないでください。
 """
         response = gemini_client.generate_content(prompt)
-        return {
-            'status': 'success',
-            'report': response.text,
-            'model': 'gemini-2.0-flash-exp'
-        }
+
+        # Geminiが空レスポンスを返す場合のハンドリング
+        response_text = None
+        if response.parts:
+            response_text = response.text
+        elif response.candidates:
+            # candidatesはあるがpartsが空の場合
+            print(f"Gemini相場調査: partsが空（finish_reason={response.candidates[0].finish_reason}）。簡略版で再試行...")
+            # 簡略化したプロンプトで再試行（URL要求を外す）
+            retry_prompt = f"""不動産投資の専門家として、以下の物件周辺の賃貸市場について調査してください。
+
+物件住所: {address}
+最寄駅: {station}駅{walking_desc}
+{spec_text}
+
+以下を回答してください:
+1. {station}駅周辺エリアの特徴（住環境、交通利便性、人口動態）
+2. 類似物件（構造・築年・面積が近い）の家賃相場の目安
+3. 賃貸需要の強さと空室リスク
+4. 投資観点での評価コメント
+
+プレーンテキストで出力してください。マークダウン記法は使わないでください。"""
+            retry_response = gemini_client.generate_content(retry_prompt)
+            if retry_response.parts:
+                response_text = retry_response.text
+                print("Gemini相場調査: 簡略版で成功")
+
+        if response_text:
+            return {
+                'status': 'success',
+                'report': response_text,
+                'model': 'gemini-2.5-flash'
+            }
+        else:
+            print("Gemini相場調査: 空レスポンス（リトライでも失敗）")
+            return {
+                'status': 'error',
+                'error': 'empty_response',
+                'report': '相場調査データを取得できませんでした。'
+            }
     except Exception as e:
         print(f"Gemini相場調査エラー: {e}")
         return {
