@@ -5,9 +5,12 @@ Gmailから販売図面・住宅地図メールを取得し、Google Driveに自
 
 import os
 import re
+import threading
+import time
 from flask import Flask, request, jsonify
 from google.cloud import secretmanager
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as AuthRequest
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 from typing import Optional
@@ -23,86 +26,95 @@ app = Flask(__name__)
 secret_client = secretmanager.SecretManagerServiceClient()
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 
-def get_secret(secret_name):
-    """Secret Managerからシークレットを取得"""
+def _read_secret(secret_name):
+    """環境変数から読み取り、なければSecret Manager APIにフォールバック"""
+    val = os.environ.get(secret_name)
+    if val:
+        return val
     name = f"projects/{PROJECT_ID}/secrets/{secret_name}/versions/latest"
     response = secret_client.access_secret_version(request={"name": name})
     return response.payload.data.decode("UTF-8")
 
+# ============================================================
+# OAuth Credential Cache（スレッドセーフ）
+# ============================================================
+_creds_lock = threading.Lock()
+_cached_creds: Optional[Credentials] = None
+_cached_creds_expiry: float = 0
+
+ALL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+]
+
+def get_credentials() -> Credentials:
+    """共有キャッシュ付きCredentialsを返す。スレッドセーフ。"""
+    global _cached_creds, _cached_creds_expiry
+
+    with _creds_lock:
+        now = time.time()
+        # キャッシュが有効なら（期限5分前まで）そのまま返す
+        if _cached_creds and _cached_creds.token and now < (_cached_creds_expiry - 300):
+            return _cached_creds
+
+        # 初回 or キャッシュ無効時: Credentialsオブジェクトを作成
+        if _cached_creds is None:
+            _cached_creds = Credentials(
+                token=None,
+                refresh_token=_read_secret("GMAIL_REFRESH_TOKEN"),
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=_read_secret("GMAIL_CLIENT_ID"),
+                client_secret=_read_secret("GMAIL_CLIENT_SECRET"),
+                scopes=ALL_SCOPES,
+            )
+
+        # Access tokenをリフレッシュ
+        try:
+            _cached_creds.refresh(AuthRequest())
+            _cached_creds_expiry = now + 3600
+            print(f"OAuth token refreshed, expires in ~60 min")
+        except Exception as e:
+            print(f"ERROR: OAuth token refresh failed: {e}")
+            _cached_creds = None
+            _cached_creds_expiry = 0
+            raise RuntimeError(
+                f"OAuth token refresh failed. "
+                f"POST /refresh-token で再試行するか、get_refresh_token.py を再実行してください。"
+                f"Error: {e}"
+            )
+
+        return _cached_creds
+
+def invalidate_credentials():
+    """キャッシュを無効化し、次回呼び出し時に再作成させる"""
+    global _cached_creds, _cached_creds_expiry
+    with _creds_lock:
+        _cached_creds = None
+        _cached_creds_expiry = 0
+        print("Credentials cache invalidated")
+
 def get_gmail_service():
-    """Gmail APIサービスを取得"""
-    client_id = get_secret("GMAIL_CLIENT_ID")
-    client_secret = get_secret("GMAIL_CLIENT_SECRET")
-    refresh_token = get_secret("GMAIL_REFRESH_TOKEN")
-
-    # 修正：正しいスコープを指定
-    creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=[
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.labels",
-            "https://www.googleapis.com/auth/drive"  # drive.file → drive に変更
-        ]
-    )
-
-    return build('gmail', 'v1', credentials=creds)
+    """Gmail APIサービスを取得（cached credentials）"""
+    return build('gmail', 'v1', credentials=get_credentials())
 
 def get_drive_service():
-    """Drive APIサービスを取得"""
-    client_id = get_secret("GMAIL_CLIENT_ID")
-    client_secret = get_secret("GMAIL_CLIENT_SECRET")
-    refresh_token = get_secret("GMAIL_REFRESH_TOKEN")
-
-    # 修正：正しいスコープを指定
-    creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=[
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.labels",
-            "https://www.googleapis.com/auth/drive"  # drive.file → drive に変更
-        ]
-    )
-
-    return build('drive', 'v3', credentials=creds)
+    """Drive APIサービスを取得（cached credentials）"""
+    return build('drive', 'v3', credentials=get_credentials())
 
 def get_docs_service():
-    """Docs APIサービスを取得"""
-    client_id = get_secret("GMAIL_CLIENT_ID")
-    client_secret = get_secret("GMAIL_CLIENT_SECRET")
-    refresh_token = get_secret("GMAIL_REFRESH_TOKEN")
-
-    creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=[
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.labels",
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/documents"
-        ]
-    )
-
-    return build('docs', 'v1', credentials=creds)
+    """Docs APIサービスを取得（cached credentials）"""
+    return build('docs', 'v1', credentials=get_credentials())
 
 def get_gmaps_client():
     """Google Maps APIクライアントを取得"""
-    api_key = get_secret("GOOGLE_MAPS_API_KEY")
+    api_key = _read_secret("GOOGLE_MAPS_API_KEY")
     return googlemaps.Client(key=api_key)
 
 def get_gemini_client():
     """Gemini APIクライアントを取得"""
-    api_key = get_secret("GEMINI_API_KEY")
+    api_key = _read_secret("GEMINI_API_KEY")
     genai.configure(api_key=api_key)
     # Gemini 2.5 Flash (2026年現在の推奨モデル、1.5は廃止済み)
     return genai.GenerativeModel('gemini-2.5-flash')
@@ -112,7 +124,7 @@ def get_perplexity_client():
     try:
         # PERPLEXITY_API_KEYはオプション（なければフリー層で動作）
         try:
-            api_key = get_secret("PERPLEXITY_API_KEY")
+            api_key = _read_secret("PERPLEXITY_API_KEY")
             print("Perplexity API Key取得成功（有料層）")
         except Exception:
             api_key = "pplx-dummy-key"  # フリー層用
@@ -818,7 +830,7 @@ def _insert_map_image(docs_service, drive_service, doc_id, location):
         ).execute()
 
         lat, lng = location['lat'], location['lng']
-        api_key = get_secret("GOOGLE_MAPS_API_KEY")
+        api_key = _read_secret("GOOGLE_MAPS_API_KEY")
 
         # Google Maps Static API で画像ダウンロード
         map_url = (
@@ -1707,8 +1719,8 @@ def process_emails():
     gmail = get_gmail_service()
     drive = get_drive_service()
 
-    investment_folder_id = get_secret("INVESTMENT_FOLDER_ID")
-    label_name = get_secret("PROCESSED_LABEL_NAME")
+    investment_folder_id = _read_secret("INVESTMENT_FOLDER_ID")
+    label_name = _read_secret("PROCESSED_LABEL_NAME")
     processed_label_id = get_or_create_label(gmail, label_name)
 
     all_results = []
@@ -1828,6 +1840,76 @@ def index():
 def health():
     """ヘルスチェック"""
     return jsonify({"status": "ok"})
+
+@app.route('/auth-status', methods=['GET'])
+def auth_status():
+    """OAuth認証状態の確認"""
+    try:
+        status = {
+            "has_cached_creds": _cached_creds is not None,
+            "has_token": _cached_creds.token is not None if _cached_creds else False,
+            "token_expiry": _cached_creds_expiry,
+            "seconds_until_expiry": max(0, _cached_creds_expiry - time.time()) if _cached_creds_expiry else 0,
+            "env_vars_present": {
+                "GMAIL_CLIENT_ID": bool(os.environ.get("GMAIL_CLIENT_ID")),
+                "GMAIL_CLIENT_SECRET": bool(os.environ.get("GMAIL_CLIENT_SECRET")),
+                "GMAIL_REFRESH_TOKEN": bool(os.environ.get("GMAIL_REFRESH_TOKEN")),
+            }
+        }
+        # Gmail APIで疎通確認
+        try:
+            creds = get_credentials()
+            gmail = build('gmail', 'v1', credentials=creds)
+            profile = gmail.users().getProfile(userId='me').execute()
+            status["gmail_email"] = profile.get("emailAddress")
+            status["gmail_ok"] = True
+        except Exception as e:
+            status["gmail_ok"] = False
+            status["gmail_error"] = str(e)
+
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/refresh-token', methods=['POST'])
+def refresh_token_endpoint():
+    """緊急用: OAuthトークンの強制リフレッシュ。
+    新しいrefresh_tokenをJSONで渡すことも可能。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        new_token = data.get('refresh_token')
+
+        if new_token:
+            global _cached_creds, _cached_creds_expiry
+            with _creds_lock:
+                _cached_creds = Credentials(
+                    token=None,
+                    refresh_token=new_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=_read_secret("GMAIL_CLIENT_ID"),
+                    client_secret=_read_secret("GMAIL_CLIENT_SECRET"),
+                    scopes=ALL_SCOPES,
+                )
+                _cached_creds_expiry = 0
+            print("Refresh token updated in memory")
+        else:
+            invalidate_credentials()
+
+        creds = get_credentials()
+        return jsonify({
+            "status": "success",
+            "message": "Credentials refreshed successfully",
+            "token_valid": creds.token is not None,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "fix": "get_refresh_token.py を再実行して新しいrefresh tokenを取得し、"
+                   "Secret Managerを更新してください。"
+        }), 500
 
 @app.route('/process', methods=['POST'])
 def process():
@@ -2003,7 +2085,7 @@ def test_list_folders():
     """投資フォルダ内の物件フォルダ一覧を取得"""
     try:
         drive = get_drive_service()
-        investment_folder_id = get_secret("INVESTMENT_FOLDER_ID")
+        investment_folder_id = _read_secret("INVESTMENT_FOLDER_ID")
 
         query = f"'{investment_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
         results = drive.files().list(

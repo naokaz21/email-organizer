@@ -66,29 +66,45 @@ def main():
         redirect_uri='http://localhost:8080/'
     )
 
-    # 認証実行（ブラウザが開く）
+    # prompt='consent' で常に新しいrefresh tokenを取得
     creds = flow.run_local_server(
         port=8080,
         authorization_prompt_message='ブラウザで認証してください...',
-        success_message='認証成功！このタブを閉じてターミナルに戻ってください。'
+        success_message='認証成功！このタブを閉じてターミナルに戻ってください。',
+        access_type='offline',
+        prompt='consent'
     )
 
     print()
     print("=" * 60)
-    print("✅ 認証成功！")
+    print("認証成功！")
     print("=" * 60)
     print()
-    print("📝 Refresh Token:")
+    print("Refresh Token:")
     print(creds.refresh_token)
     print()
-    print("=" * 60)
-    print("次のステップ:")
-    print("=" * 60)
-    print("1. 上記の refresh_token をコピー")
-    print("2. Secret Manager の GMAIL_REFRESH_TOKEN を更新")
-    print()
-    print("コマンド:")
-    print(f"echo -n '{creds.refresh_token}' | gcloud secrets versions add GMAIL_REFRESH_TOKEN --data-file=-")
+
+    # Secret Manager 自動更新
+    answer = input("Secret Manager の GMAIL_REFRESH_TOKEN を自動更新しますか？ (Y/n): ").strip()
+    if answer.lower() != 'n':
+        import subprocess
+        result = subprocess.run(
+            ['gcloud', 'secrets', 'versions', 'add', 'GMAIL_REFRESH_TOKEN',
+             '--data-file=-', '--project=project-3255e657-b52f-4d63-ae7'],
+            input=creds.refresh_token.encode(),
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print("Secret Manager 更新完了！")
+            print("Cloud Run は次回リクエスト時に新しいトークンを自動的に使用します。")
+        else:
+            print(f"更新失敗: {result.stderr}")
+            print()
+            print("手動コマンド:")
+            print(f"echo -n '{creds.refresh_token}' | gcloud secrets versions add GMAIL_REFRESH_TOKEN --data-file=- --project=project-3255e657-b52f-4d63-ae7")
+    else:
+        print("手動コマンド:")
+        print(f"echo -n '{creds.refresh_token}' | gcloud secrets versions add GMAIL_REFRESH_TOKEN --data-file=- --project=project-3255e657-b52f-4d63-ae7")
     print()
 
 if __name__ == '__main__':
